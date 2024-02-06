@@ -20,13 +20,14 @@ To achieve this the dataframe will create 4 options, two using direct vectorizat
 
 For example _prepare_funcs will transform your function test_func that is like:
 
+```python
 def test_func(z):
     x = (z['A']+z['B'])
     x = z['B']*z['D']
     return x / z['B']
-
+```
 Into this one for the loop method:
-
+```python
 @nb.jit(nopython=True, nogil=True, parallel=True)
 def cdmtest_func(Z):
     def callmap(x):
@@ -48,3 +49,4 @@ def cdmtest_func(Z):
     for i in nb.prange(5, n):
         res[i,0] = np.var(Z[i,:])
     return res
+```
