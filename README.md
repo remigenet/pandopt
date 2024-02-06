@@ -12,7 +12,7 @@ Being directly inherited from pandas, while having some mecanism to ensure not l
 
 ## What works now ?
 
-The DataFrame.apply(callable, axis) is the first and working and most tested method, even if the first initialization of a func can be long, it's quickly forgetten with an average mulitple of the performance by x to x
+The DataFrame.apply(callable, axis) is the first and working and most tested method, even if the first initialization of a func can be long, it's quickly forgetten with an average mulitple of the performance by 3x in most cases to 2000x in best scenarios
 
 ## How it works for apply ?
 
