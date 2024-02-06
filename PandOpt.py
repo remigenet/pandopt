@@ -218,11 +218,11 @@ def autowrap_pandas_return(fn: Callable) -> Callable:
 @make_class_decorator(autowrap_pandas_return)
 class pandopt(pd.DataFrame):
     _compiled_func = None
-    _outside_call = True
+    _compiled_func = {}
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._compiled_func = {}
+        
 
     @property
     def __name__(self):
@@ -260,12 +260,13 @@ class pandopt(pd.DataFrame):
             return self.apply(*args, pandas_fallback = True, **kwargs)
         return _with_protects
     
+    
     def _build_apply_versions(self, func, map, name):
         self._compiled_func[name] = self._with_fallback_wrap(_prepare_funcs(func, map))
         return self._compiled_func[name]
 
     
-
+ 
 @make_class_decorator(autowrap_pandas_return)
 class pandopt(pd.DataFrame):
     _compiled_func = {}
