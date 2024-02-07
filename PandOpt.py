@@ -217,64 +217,11 @@ def autowrap_pandas_return(fn: Callable) -> Callable:
 
 @make_class_decorator(autowrap_pandas_return)
 class pandopt(pd.DataFrame):
-    _compiled_func = None
-    _compiled_func = {}
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        
-
-    @property
-    def __name__(self):
-        return functools.reduce(lambda x, y: x + y, self.name_to_index.keys())
-
-    @property
-    def colname_to_colnum(self):
-        return {k: i for i, k in enumerate(self.columns)}
-
-    @property
-    def rowname_to_rownum(self):
-        return {k: i for i, k in enumerate(self.index)}
-    
-    def _compiled_qualifier(self, func_qualifier, mapper):
-        return hash(functools.reduce(lambda x, y: f'{x}&{y}', mapper) + func_qualifier)
-
-    def apply(self, func, axis = 0, *args, pandas_fallback = False, **kwargs):
-        if pandas_fallback: 
-            logger.warning(f'{__class__} finish in pandas fallback for func {func}')
-            return super().apply(func, axis = 0, *args, **kwargs)
-        if args or kwargs:
-            logger.warning(f'{__class__} apply only supports func and axis arguments, using default pandas apply')
-            return super().apply(func, axis = 0, *args, **kwargs)
-        return pandopt((self._compiled_func.get((name:=self._compiled_qualifier(func_qualifier = func.__qualname__, mapper=(mapper:=self.colname_to_colnum if axis else self.rowname_to_rownum)))) or self._build_apply_versions(func, mapper, name))(self.to_numpy() if axis else self.to_numpy().T), index = self.index if axis else self.columns)
-
-    def _with_fallback_wrap(self, apply_func_dict):
-        def _with_protects(*args, **kwargs):
-            for key in ('_vectorized_nb_compyled', '_loop_compyled', '_vectorized', '_loop'):
-                if key not in apply_func_dict:
-                    continue
-                try:
-                    return apply_func_dict[key](*args, **kwargs)
-                except:
-                    apply_func_dict.pop(key)
-            return self.apply(*args, pandas_fallback = True, **kwargs)
-        return _with_protects
-    
-    
-    def _build_apply_versions(self, func, map, name):
-        self._compiled_func[name] = self._with_fallback_wrap(_prepare_funcs(func, map))
-        return self._compiled_func[name]
-
-    
- 
-@make_class_decorator(autowrap_pandas_return)
-class pandopt(pd.DataFrame):
     _compiled_func = {}
     _outside_call = True
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # self._compiled_func = {}
 
     @property
     def __name__(self):
@@ -291,14 +238,23 @@ class pandopt(pd.DataFrame):
     def _compiled_qualifier(self, func_qualifier, mapper):
         return hash(functools.reduce(lambda x, y: f'{x}&{y}', mapper) + func_qualifier)
 
-    def apply(self, func, axis = 0, *args, pandas_fallback = False, **kwargs):
-        if pandas_fallback: 
-            logger.warning(f'{__class__} finish in pandas fallback for func {func}')
-            return super().apply(func, axis = 0, *args, **kwargs)
-        if args or kwargs:
-            logger.warning(f'{__class__} apply only supports func and axis arguments, using default pandas apply')
-            return super().apply(func, axis = 0, *args, **kwargs)
-        return pandopt((self._compiled_func.get((name:=self._compiled_qualifier(func_qualifier = func.__qualname__, mapper=(mapper:=self.colname_to_colnum if axis else self.rowname_to_rownum)))) or self._build_apply_versions(func, mapper, name))(self.to_numpy() if axis else self.to_numpy().T), index = self.index if axis else self.columns)
+    @property
+    def __name__(self):
+        return functools.reduce(laapply_benchmarks-Copy1(lambda x, y: f'{x}&{y}', mapper) + func_qualifier)
+
+    def apply(self, func, axis = 0, *args, pandas_fallback = False, data = None, **kwargs):
+        if pandas_fallback or args or kwargs: 
+            logger.warning(f'{__class__} {"finish in pandas fallback for func "+func.__qualname__ if pandas_fallback else "apply only supports func and axis arguments, using default pandas apply"}')
+            return super().apply(func, axis = axis, *args, **kwargs)
+        mapping = self.rowname_to_rownum if axis else self.colname_to_colnum
+        name = self._compiled_qualifier(
+            func_qualifier = func.__qualname__,
+            mapper=mapping
+        )
+        prepared_func = self._with_fallback_wrap(self._build_apply_versions(func, mapping, name))
+        data =  data.T if data is not None else (self.to_numpy().T if axis else self.to_numpy())
+        return pandopt(prepared_func(data))
+
 
     def _with_fallback_wrap(self, apply_func_dict):
         def _with_protects(*args, **kwargs):
@@ -311,36 +267,52 @@ class pandopt(pd.DataFrame):
                     apply_func_dict.pop(key)
             return self.apply(*args, pandas_fallback = True, **kwargs)
         return _with_protects
-    
-    def _build_apply_versions(self, func, map, name):
-        self._compiled_func[name] = self._with_fallback_wrap(_prepare_funcs(func, map))
-        return self._compiled_func[name]
+
+    def _compiled_qualifier(self, func_qualifier, mapper):
+        return hash(functools.reduce(lambda x, y: f'{x}&{y}', mapper) + func_qualifier)
+
+    @classmethod
+    def _build_apply_versions(cls, func, map, name):
+        if name not in cls._compiled_func:
+            cls._compiled_func[name] = _prepare_funcs(func, map)
+        return cls._compiled_func[name]
 
     def rolling(self, window, *args, **kwargs):
         return pandoptRoll(self, window=window, *args, **kwargs)
 
     
     def groupby(self, *args, **kwargs):
+        raise NotImplementedError('Expanding not yet implemented')
         return pandoptGroupBy(self, *args, **kwargs)
 
     def resample(self, *args, **kwargs):
+        raise NotImplementedError('Expanding not yet implemented')
         return pandoptResampler(self, *args, **kwargs)
 
     def expanding(self, *args, **kwargs):
+        raise NotImplementedError('Expanding not yet implemented')
         return pandoptExpanding(self, *args, **kwargs)
 
 
-    def _apply_with_compiled_func(self, func, data, axis=0, *args, **kwargs):
-        name = self._compiled_qualifier(func_qualifier=(func_name:=func.__qualname__), mapper=(mapper:=self.colname_to_colnum if axis else self.rowname_to_rownum))
-        compiled_func = self._compiled_func.get(name) or self._build_apply_versions(func, mapper, name)
-        return res.T if hasattr((res:=compiled_func(data, *args, **kwargs)), 'T') else res
 
 @make_class_decorator(autowrap_pandas_return)
 class pandoptRoll(pd.core.window.rolling.Rolling):
     _outside_call = True
-    def __init__(self, df, *args, **kwargs):
-        self._idf = df
-        super().__init__(df, *args, **kwargs)
+    def __init__(self, df, window=10, *args, **kwargs):
+        self._idf = pandopt(df) if not isinstance(df, pandopt) else df
+        super().__init__(self._idf, window=window, *args, **kwargs)
+
+
+    def apply(self, func, axis = 1, *args, pandas_fallback=False, raw = True, **kwargs):
+        try:
+            data = sliding_window_view(self._idf.to_numpy(), self.window, axis=0)
+            return self._idf.apply(func, axis = axis, *args, data = data, pandas_fallback=pandas_fallback, **kwargs)#.reindex(self._idf.index, axis=0)
+        except Exception as e:
+            logger.warning(f'Error in pandoptRoll apply: {e}')
+            if pandas_fallback:
+                return super().apply(func, *args, **kwargs)
+            raise e
+            
 
     def agg(self, func, *args, **kwargs):
         if isinstance(func, dict):
@@ -357,21 +329,13 @@ class pandoptRoll(pd.core.window.rolling.Rolling):
         else:
             return self.apply(func, *args, **kwargs)
         
-    def apply(self, func, *args, pandas_fallback=False, **kwargs):
-        try:
-            return pandopt(self._idf._apply_with_compiled_func(func, sliding_window_view(self._idf.to_numpy(), self.window, axis=0), axis=2, *args, **kwargs), columns=self._idf.columns, index=self._idf.index[self.window-1:])
-        except Exception as e:
-            logger.warning(f'Error in pandoptRoll apply: {e}')
-            if pandas_fallback:
-                return super().apply(func, *args, **kwargs)
-            raise
-            
+
 @make_class_decorator(autowrap_pandas_return)
 class pandoptGroupBy(pd.core.groupby.DataFrameGroupBy):
     _outside_call = True
     def __init__(self, df, *args, **kwargs):
-        self._idf = df
-        super().__init__(df, *args, **kwargs)
+        self._idf = pandopt(df)
+        super().__init__(self._idf, *args, **kwargs)
 
     def agg(self, func, *args, **kwargs):
         if isinstance(func, dict):
@@ -409,53 +373,53 @@ class pandoptGroupBy(pd.core.groupby.DataFrameGroupBy):
                 return super().apply(func, *args, **kwargs)
             raise
 
-@make_class_decorator(autowrap_pandas_return)
-class pandoptResampler(pd.core.resample.Resampler):
-    _outside_call = True
-    def __init__(self, df, *args, **kwargs):
-        self._idf = df
-        super().__init__(df, *args, **kwargs)
+# @make_class_decorator(autowrap_pandas_return)
+# class pandoptResampler(pd.core.resample.Resampler):
+#     _outside_call = True
+#     def __init__(self, df, *args, **kwargs):
+#         self._idf = pandopt(df)
+#         super().__init__(self._idf, *args, **kwargs)
 
-    def agg(self, func, *args, **kwargs):
-        if isinstance(func, dict):
-            results = {col: (super().agg({col: f}) if f in ['mean', 'std', 'sum', 'min', 'max', 'count', 'median'] else self.apply(lambda x: x[col].pipe(f), *args, **kwargs)) for col, f in func.items()}
-            return pandopt(results)
-        elif func in ['mean', 'std', 'sum', 'min', 'max', 'count', 'median']:
-            return super().agg(func, *args, **kwargs)
-        else:
-            return self.apply(func, *args, **kwargs)
+#     def agg(self, func, *args, **kwargs):
+#         if isinstance(func, dict):
+#             results = {col: (super().agg({col: f}) if f in ['mean', 'std', 'sum', 'min', 'max', 'count', 'median'] else self.apply(lambda x: x[col].pipe(f), *args, **kwargs)) for col, f in func.items()}
+#             return pandopt(results)
+#         elif func in ['mean', 'std', 'sum', 'min', 'max', 'count', 'median']:
+#             return super().agg(func, *args, **kwargs)
+#         else:
+#             return self.apply(func, *args, **kwargs)
 
-    def apply(self, func, *args, pandas_fallback=False, **kwargs):
-        try:
-            if pandas_fallback:
-                return super().apply(func, *args, **kwargs)
-            return self._idf._apply_with_compiled_func(func, self._idf.to_numpy(), *args, **kwargs)
-        except Exception as e:
-            logger.warning(f'Error in pandoptResampler apply: {e}')
-            return super().apply(func, *args, **kwargs)
+#     def apply(self, func, *args, pandas_fallback=False, **kwargs):
+#         try:
+#             if pandas_fallback:
+#                 return super().apply(func, *args, **kwargs)
+#             return self._idf._apply_with_compiled_func(func, self._idf.to_numpy(), *args, **kwargs)
+#         except Exception as e:
+#             logger.warning(f'Error in pandoptResampler apply: {e}')
+#             return super().apply(func, *args, **kwargs)
 
-@make_class_decorator(autowrap_pandas_return)
-class pandoptExpanding(pd.core.window.expanding.Expanding):
-    _outside_call = True
-    def __init__(self, df, *args, **kwargs):
-        self._idf = df
-        super().__init__(df, *args, **kwargs)
+# @make_class_decorator(autowrap_pandas_return)
+# class pandoptExpanding(pd.core.window.expanding.Expanding):
+#     _outside_call = True
+#     def __init__(self, df, *args, **kwargs):
+#         self._idf = df
+#         super().__init__(df, *args, **kwargs)
 
-    def agg(self, func, *args, **kwargs):
-        if isinstance(func, dict):
-            results = {col: (super().agg({col: f}) if f in ['mean', 'std', 'sum', 'min', 'max', 'count', 'median'] else self.apply(lambda x: x[col].pipe(f), *args, **kwargs)) for col, f in func.items()}
-            return pandopt(results)
-        elif func in ['mean', 'std', 'sum', 'min', 'max', 'count', 'median']:
-            return super().agg(func, *args, **kwargs)
-        else:
-            return self.apply(func, *args, **kwargs)
+#     def agg(self, func, *args, **kwargs):
+#         if isinstance(func, dict):
+#             results = {col: (super().agg({col: f}) if f in ['mean', 'std', 'sum', 'min', 'max', 'count', 'median'] else self.apply(lambda x: x[col].pipe(f), *args, **kwargs)) for col, f in func.items()}
+#             return pandopt(results)
+#         elif func in ['mean', 'std', 'sum', 'min', 'max', 'count', 'median']:
+#             return super().agg(func, *args, **kwargs)
+#         else:
+#             return self.apply(func, *args, **kwargs)
 
-    def apply(self, func, *args, pandas_fallback=False, **kwargs):
-        try:
-            if pandas_fallback:
-                return super().apply(func, *args, **kwargs)
-            return self._idf._apply_with_compiled_func(func, self._idf.to_numpy(), *args, **kwargs)
-        except Exception as e:
-            logger.warning(f'Error in pandoptExpanding apply: {e}')
-            return super().apply(func, *args, **kwargs)
+#     def apply(self, func, *args, pandas_fallback=False, **kwargs):
+#         try:
+#             if pandas_fallback:
+#                 return super().apply(func, *args, **kwargs)
+#             return self._idf._apply_with_compiled_func(func, self._idf.to_numpy(), *args, **kwargs)
+#         except Exception as e:
+#             logger.warning(f'Error in pandoptExpanding apply: {e}')
+#             return super().apply(func, *args, **kwargs)
 
