@@ -5,6 +5,7 @@ import numpy as np
 import numba as nb
 import pandas as pd
 import time
+from enum import Enum
 import logging
 import functools
 import copy
@@ -20,10 +21,15 @@ def create_callmap_function_ast(mapping: Dict[str, int]) -> ast.FunctionDef:
     # Create the body of the callmap function
     body = []
     for key, value in mapping.items():
+        try:
+            key = int(key)
+            continue
+        except ValueError:
+            key = ast.Constant(value=key)
         compare = ast.Compare(
             left=ast.Name(id='x', ctx=ast.Load()),
             ops=[ast.Eq()],
-            comparators=[ast.Constant(value=key)]
+            comparators=[key]
         )
         body.append(
             ast.If(
@@ -76,41 +82,49 @@ class SubscriptReplacer(ast.NodeTransformer):
             )
         return self.generic_visit(node) 
 
-def create_transformed_function_ast(original_func: Callable, mapping: Dict[str, int]) -> Tuple[ast.AST, ast.AST, ast.AST]:
+def create_transformed_function_ast(original_func: Callable, mapping: Dict[str, int], func_int_identifier: str, D3_to_D2: bool = False, no_vectorized = False) -> Tuple[ast.AST, ast.AST, ast.AST]:
     # Parse the original function
     original_tree = ast.parse(inspect.getsource(original_func))
     arg_name = original_tree.body[0].args.args[0].arg
     
-    # Rename the original function
     original_tree.body[0].name = 'temporary'
     
-    # Apply the AST transformation
     replacer = SubscriptReplacer(arg_name)
     original_tree = replacer.visit(original_tree)
     ast.fix_missing_locations(original_tree)
 
-    # Replace dictionary accesses with callmap in the original function
-    # This would be similar to the code in SubscriptReplacer
-
-    # Create a new function that applies 'temporary' over an array
-    loop_base_func_str = f"""
-def {original_func.__qualname__}_loop(Z):
+    if D3_to_D2:
+        loop_base_func_str = f"""
+def {func_int_identifier}_loop(Z):
+    n, c, t = Z.shape
+    res = np.zeros((n, c))
+    for col in nb.prange(c):
+        for row in nb.prange(n):
+            res[row, col] = temporary(Z[row,col,:])
+    return res
+        """
+    else:
+        loop_base_func_str = f"""
+def {func_int_identifier}_loop(Z):
     n = Z.shape[0]
     res = np.zeros((n, 1))
     for i in nb.prange(n):
         res[i, 0] = temporary(Z[i, :])
     return res
-    """
-    vectorized_base_func_str = f"""
-def {original_func.__qualname__}_vectorized(Z):
-    return temporary(Z.T)
-    """
+        """
     loop_func_tree = ast.parse(loop_base_func_str)
-    vectorize_func_tree = ast.parse(vectorized_base_func_str)
+    vectorize_func_tree = None
+    if not no_vectorized:
+        vectorized_base_func_str = f"""
+def {func_int_identifier}_vectorized(Z):
+    return temporary(Z.T)
+        """
+        vectorize_func_tree = ast.parse(vectorized_base_func_str)
 
     return original_tree, loop_func_tree, vectorize_func_tree
 
-def numba_decorate(func_tree: ast.AST, nopython: bool = True, nogil: bool = True, parallel: bool = True) -> ast.AST:
+def numba_decorate(func_tree: ast.AST, nopython: bool = True, nogil: bool = True, parallel: bool = True,
+ fastmath: bool = True, forceinline: bool = True, looplift: bool = True, target_backend: bool = True, no_cfunc_wrapper: bool = True) -> ast.AST:
     # # Add Numba JIT decorator
     nb_compyled_func_tree = copy.deepcopy(ast.fix_missing_locations(func_tree))
     numba_decorator = ast.Call(
@@ -119,7 +133,12 @@ def numba_decorate(func_tree: ast.AST, nopython: bool = True, nogil: bool = True
         keywords=[
             ast.keyword(arg='nopython', value=ast.Constant(value=nopython)),
             ast.keyword(arg='nogil', value=ast.Constant(value=nogil)),
-            ast.keyword(arg='parallel', value=ast.Constant(value=parallel))
+            ast.keyword(arg='parallel', value=ast.Constant(value=parallel)),
+            ast.keyword(arg='fastmath', value=ast.Constant(value=fastmath)),
+            ast.keyword(arg='forceinline', value=ast.Constant(value=forceinline)),
+            ast.keyword(arg='looplift', value=ast.Constant(value=looplift)),
+            ast.keyword(arg='target_backend', value=ast.Constant(value=target_backend)),
+            ast.keyword(arg='no_cfunc_wrapper', value=ast.Constant(value=no_cfunc_wrapper))
         ]
     )
     nb_compyled_func_tree.body[0].decorator_list.append(numba_decorator)
@@ -140,28 +159,86 @@ def compile_tree(built_func_tree: ast.AST, exec_globals: Dict[str, Any], qualnam
     return {}
 
 
-def _prepare_funcs(original_func: ast.AST, mapping: Dict[str, int]) -> Dict[str, Callable]:
+def _prepare_funcs(original_func: ast.AST, mapping: Dict[str, int], func_int_identifier: str, D3_to_D2: bool = False, no_vectorized = False) -> Dict[str, Callable]:
     exec_globals = globals().copy()
     exec_globals.update({'np': np, 'nb': nb})
     callmap_func_ast = create_callmap_function_ast(mapping)
     callmap_func_tree = ast.fix_missing_locations(ast.Module(body=[callmap_func_ast], type_ignores=[]))
-    original_tree, loop_func_tree, vectorize_func_tree = create_transformed_function_ast(original_func, mapping)
+    original_tree, loop_func_tree, vectorize_func_tree = create_transformed_function_ast(original_func, mapping, func_int_identifier, D3_to_D2 = D3_to_D2)
+    available_funcs = {}
 
     loop_func_tree = encapulate(loop_func_tree, callmap_func_tree, original_tree)
-    vectorize_func_tree = encapulate(vectorize_func_tree, callmap_func_tree, original_tree)
-    
-    available_funcs = {}
-    available_funcs.update(compile_tree(vectorize_func_tree, exec_globals, original_func.__qualname__, '_vectorized'))
-    available_funcs.update(compile_tree(loop_func_tree, exec_globals, original_func.__qualname__, '_loop'))
-    
-    nb_compyled_loop_func_tree = numba_decorate(loop_func_tree)
-    nb_compyled_vectorize_func_tree = numba_decorate(vectorize_func_tree)
+    available_funcs.update(compile_tree(loop_func_tree, exec_globals, func_int_identifier, '_loop'))
 
-    available_funcs.update(compile_tree(nb_compyled_vectorize_func_tree, exec_globals, original_func.__qualname__, '_vectorized_nb_compyled'))
-    available_funcs.update(compile_tree(nb_compyled_loop_func_tree, exec_globals, original_func.__qualname__, '_loop_nb_compyled'))
+    if not no_vectorized:
+        vectorize_func_tree = encapulate(vectorize_func_tree, callmap_func_tree, original_tree)
+        available_funcs.update(compile_tree(vectorize_func_tree, exec_globals, func_int_identifier, '_vectorized'))
+
+    nb_compyled_loop_func_tree = numba_decorate(loop_func_tree)
+    if not no_vectorized:
+        nb_compyled_vectorize_func_tree = numba_decorate(vectorize_func_tree)
+        available_funcs.update(compile_tree(nb_compyled_vectorize_func_tree, exec_globals, func_int_identifier, '_vectorized_nb_compyled'))
+
+
+    available_funcs.update(compile_tree(nb_compyled_loop_func_tree, exec_globals, func_int_identifier, '_loop_nb_compyled'))
 
     return available_funcs
 
+
+
+
+def standard_sum(z):
+    return np.sum(z)
+
+def standard_mean(z):
+    return np.mean(z)
+
+def standard_max(z):
+    return np.max(z)
+
+def standard_min(z):
+    return np.min(z)
+
+def standard_std(z):
+    return np.std(z)
+
+def standard_median(z):
+    return np.median(z)
+
+def standard_count(z):
+    return np.count(z)
+
+
+
+class StandardFunctions(Enum):
+    SUM = standard_sum
+    MEAN = standard_mean
+    MAX = standard_max
+    MIN = standard_min
+    STD = standard_std
+    MEDIAN = standard_median
+    COUNT = standard_count
+    
+def load_function(fname: str):
+    if isinstance(fname, Callable):
+        return fname
+    elif isinstance(fname, str):
+        fname = fname.stip().upper()
+        if fname == 'SUM':
+            return StandardFunctions.SUM.value
+        elif fname == 'MEAN':
+            return StandardFunctions.MEAN.value
+        elif fname == 'MAX':
+            return StandardFunctions.MAX.value
+        elif fname == 'STD':
+            return StandardFunctions.STD.value
+        elif fname == 'median':
+            return StandardFunctions.MEDIAN.value
+        elif fname == 'COUNT':
+            return StandardFunctions.COUNT.value
+        raise ValueError(f'Unable to find function {fname}')
+    else:
+        raise TypeError(f'fname cannot be {type(fname)}')
 
 def make_class_decorator(function_decorator: Callable) -> Callable:
     """
@@ -223,9 +300,9 @@ class pandopt(pd.DataFrame):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-    @property
-    def __name__(self):
-        return functools.reduce(lambda x, y: x + y, self.name_to_index.keys())
+
+    def to_pandas(self):
+        return pd.DataFrame(self)
 
     @property
     def colname_to_colnum(self):
@@ -234,48 +311,63 @@ class pandopt(pd.DataFrame):
     @property
     def rowname_to_rownum(self):
         return {k: i for i, k in enumerate(self.index)}
-    
-    def _compiled_qualifier(self, func_qualifier, mapper):
-        return hash(functools.reduce(lambda x, y: f'{x}&{y}', mapper) + func_qualifier)
 
     @property
     def __name__(self):
-        return functools.reduce(laapply_benchmarks-Copy1(lambda x, y: f'{x}&{y}', mapper) + func_qualifier)
+        return 'fid' + functools.reduce(laapply_benchmarks-Copy1(lambda x, y: f'{x}&{y}', mapper) + func_qualifier)
 
-    def apply(self, func, axis = 0, *args, pandas_fallback = False, data = None, **kwargs):
+    def apply(self, func, axis = 1, *args, pandas_fallback = False, data = None, new_index = None, from_rolling  = False, **kwargs):
         if pandas_fallback or args or kwargs: 
-            logger.warning(f'{__class__} {"finish in pandas fallback for func "+func.__qualname__ if pandas_fallback else "apply only supports func and axis arguments, using default pandas apply"}')
+            logger.warning(f'{__class__} {"finish in pandas fallback for func "+func if pandas_fallback else "apply only supports func and axis arguments, using default pandas apply"}')
             return super().apply(func, axis = axis, *args, **kwargs)
-        mapping = self.rowname_to_rownum if axis else self.colname_to_colnum
-        name = self._compiled_qualifier(
+        new_columns = None
+        if from_rolling:
+            mapping = self.colname_to_colnum if axis == 0 else {True: 0}
+            test_set = data[:min(data.shape[0] - 1, 10+ len(self.index) - len(new_index)),:,:]
+            new_columns = self.columns if axis == 0 else None
+        else:
+            data =  (self.to_numpy() if axis else self.to_numpy().T)
+            mapping = self.colname_to_colnum if axis == 0 else self.rowname_to_rownum
+            test_set = data[:min(data.shape[0] - 1, 10)]
+            new_index = self.index if axis == 1 else self.columns
+
+        func_int_identifier = self._compiled_qualifier(
             func_qualifier = func.__qualname__,
-            mapper=mapping
+            mapper=mapping,
+            D3_to_D2=from_rolling and axis==1,
+            no_vectorized=from_rolling
         )
-        prepared_func = self._with_fallback_wrap(self._build_apply_versions(func, mapping, name))
-        data =  data.T if data is not None else (self.to_numpy().T if axis else self.to_numpy())
-        return pandopt(prepared_func(data))
+        prepared_func = self._build_apply_versions(func, mapping, func_int_identifier, D3_to_D2 = from_rolling and axis == 0, no_vectorized = from_rolling)
+        test_res = prepared_func(test_set)
+        result = prepared_func(data)
+        return pandopt(result, index=new_index, columns=new_columns)
 
 
-    def _with_fallback_wrap(self, apply_func_dict):
+    def _with_fallback_wrap(self, func_int_identifier):
         def _with_protects(*args, **kwargs):
-            for key in ('_vectorized_nb_compyled', '_loop_compyled', '_vectorized', '_loop'):
-                if key not in apply_func_dict:
+            for key in ('_vectorized_nb_compyled', '_loop_nb_compyled', '_vectorized', '_loop'):
+                if key not in self.__class__._compiled_func[func_int_identifier]:
                     continue
                 try:
-                    return apply_func_dict[key](*args, **kwargs)
-                except:
-                    apply_func_dict.pop(key)
+                    result = self.__class__._compiled_func[func_int_identifier][key](*args, **kwargs)
+                    if np.shape(result):
+                        return result
+                    else:
+                        self.__class__._compiled_func[func_int_identifier].pop(key)
+                except Exception as e:
+                    print('Encountered', e)
+                    self.__class__._compiled_func[func_int_identifier].pop(key)
             return self.apply(*args, pandas_fallback = True, **kwargs)
         return _with_protects
 
-    def _compiled_qualifier(self, func_qualifier, mapper):
-        return hash(functools.reduce(lambda x, y: f'{x}&{y}', mapper) + func_qualifier)
+    def _compiled_qualifier(self, func_qualifier, mapper, D3_to_D2: bool = False, no_vectorized = False):
+        return 'fid'+ f'D3_to_D2_{no_vectorized}' +f'D3_to_D2_{D3_to_D2}' + str(functools.reduce(lambda x, y: x+y, mapper.keys())) + func_qualifier
 
-    @classmethod
-    def _build_apply_versions(cls, func, map, name):
-        if name not in cls._compiled_func:
-            cls._compiled_func[name] = _prepare_funcs(func, map)
-        return cls._compiled_func[name]
+    
+    def _build_apply_versions(self, func, mapping, func_int_identifier, D3_to_D2: bool = False, no_vectorized = False):
+        if func_int_identifier not in self.__class__._compiled_func:
+            self.__class__._compiled_func[func_int_identifier] =  _prepare_funcs(func, mapping, str(func_int_identifier), D3_to_D2 = D3_to_D2, no_vectorized = no_vectorized)
+        return self._with_fallback_wrap(func_int_identifier)
 
     def rolling(self, window, *args, **kwargs):
         return pandoptRoll(self, window=window, *args, **kwargs)
@@ -293,7 +385,16 @@ class pandopt(pd.DataFrame):
         raise NotImplementedError('Expanding not yet implemented')
         return pandoptExpanding(self, *args, **kwargs)
 
-
+        
+    def __getattr__(self, name):
+        def wrapper(*args, **kwargs):
+            try:
+                func = load_function(name)  
+            except AttributeError:
+                raise AttributeError(f"{name} not found or could not be loaded.")
+            return self.apply(func=func, *args, **kwargs)
+        return wrapper
+        
 
 @make_class_decorator(autowrap_pandas_return)
 class pandoptRoll(pd.core.window.rolling.Rolling):
@@ -303,123 +404,94 @@ class pandoptRoll(pd.core.window.rolling.Rolling):
         super().__init__(self._idf, window=window, *args, **kwargs)
 
 
-    def apply(self, func, axis = 1, *args, pandas_fallback=False, raw = True, **kwargs):
+    def apply(self, func, axis = 0, *args, pandas_fallback=False, raw = True, **kwargs):
         try:
             data = sliding_window_view(self._idf.to_numpy(), self.window, axis=0)
-            return self._idf.apply(func, axis = axis, *args, data = data, pandas_fallback=pandas_fallback, **kwargs)#.reindex(self._idf.index, axis=0)
+            r = self._idf.apply(func, axis = axis, *args, data = data, pandas_fallback=pandas_fallback, new_index =self._idf.index[self.window-1:], from_rolling = True,**kwargs)
+            return r#.reindex(self._idf.index, axis=0)
         except Exception as e:
             logger.warning(f'Error in pandoptRoll apply: {e}')
             if pandas_fallback:
                 return super().apply(func, *args, **kwargs)
             raise e
             
-
+    
     def agg(self, func, *args, **kwargs):
         if isinstance(func, dict):
-            # For dictionary input, apply each function to the respective column
             result = {}
-            for column, func_name in func.items():
-                if func_name in ['mean', 'std', 'sum', 'min', 'max', 'count', 'median']:
-                    result[column] = super().agg({column: func_name})
-                else:
-                    result[column] = self.apply(lambda x: x[column].pipe(func_name), *args, **kwargs)
+            for column, func in func.items():
+                func = load_function(func)  # CAN BE IMPROVED MUCH
+                result[column] = self.apply(lambda x: x[column].pipe(func_name), *args, **kwargs)
             return pandopt(result)
-        elif func in ['mean', 'std', 'sum', 'min', 'max', 'count', 'median']:
-            return super().agg(func, *args, **kwargs)
-        else:
-            return self.apply(func, *args, **kwargs)
+        func = load_function(func)
+        return self.apply(func, *args, **kwargs)
+
         
+    def __getattr__(self, name):
+        def wrapper(*args, **kwargs):
+            try:
+                func = load_function(name)  
+            except AttributeError:
+                raise AttributeError(f"{name} not found or could not be loaded.")
+            return self.apply(func=func, *args, **kwargs)
+        return wrapper
+    
 
-@make_class_decorator(autowrap_pandas_return)
-class pandoptGroupBy(pd.core.groupby.DataFrameGroupBy):
-    _outside_call = True
-    def __init__(self, df, *args, **kwargs):
-        self._idf = pandopt(df)
-        super().__init__(self._idf, *args, **kwargs)
+import pandas as pd
+import numpy as np
+import tqdm 
+import pandas as pd
+import numpy as np
+import timeit
+import functools
+import time
 
-    def agg(self, func, *args, **kwargs):
-        if isinstance(func, dict):
-            # For dictionary input, apply each function to the respective column
-            result = {}
-            for column, func_name in func.items():
-                if func_name in ['mean', 'std', 'sum', 'min', 'max', 'count', 'median']:
-                    result[column] = super().agg({column: func_name})
-                else:
-                    result[column] = self.apply(lambda x: x[column].pipe(func_name), *args, **kwargs)
-            return pandopt(result)
-        elif func in ['mean', 'std', 'sum', 'min', 'max', 'count', 'median']:
-            return super().agg(func, *args, **kwargs)
-        else:
-            return self.apply(func, *args, **kwargs)
 
-    def apply(self, func, *args, pandas_fallback=False, **kwargs):
-        try:
-            results = []
-            for name, group in self:
-                result_array = self._idf._apply_with_compiled_func(func, group.to_numpy(), axis=1, *args, **kwargs)
-                
-                # If the function returns a single value per group
-                if result_array.ndim == 1 or result_array.shape[1] == 1:
-                    result_df = pandopt(result_array, index=group.index, columns=[func.__name__])
-                else:
-                    result_df = pandopt(result_array, index=group.index, columns=group.columns)
-                
-                results.append(result_df)
+def agg_sum(z):
+    return np.sum(z)
 
-            return pd.concat(results, axis=0)
-        except Exception as e:
-            logger.warning(f'Error in pandoptGroupBy apply: {e}')
-            if pandas_fallback:
-                return super().apply(func, *args, **kwargs)
-            raise
+def agg_mean(z):
+    return np.mean(z)
 
-# @make_class_decorator(autowrap_pandas_return)
-# class pandoptResampler(pd.core.resample.Resampler):
-#     _outside_call = True
-#     def __init__(self, df, *args, **kwargs):
-#         self._idf = pandopt(df)
-#         super().__init__(self._idf, *args, **kwargs)
+def agg_max(z):
+    return np.max(z)
 
-#     def agg(self, func, *args, **kwargs):
-#         if isinstance(func, dict):
-#             results = {col: (super().agg({col: f}) if f in ['mean', 'std', 'sum', 'min', 'max', 'count', 'median'] else self.apply(lambda x: x[col].pipe(f), *args, **kwargs)) for col, f in func.items()}
-#             return pandopt(results)
-#         elif func in ['mean', 'std', 'sum', 'min', 'max', 'count', 'median']:
-#             return super().agg(func, *args, **kwargs)
-#         else:
-#             return self.apply(func, *args, **kwargs)
+def agg_min(z):
+    return np.min(z)
 
-#     def apply(self, func, *args, pandas_fallback=False, **kwargs):
-#         try:
-#             if pandas_fallback:
-#                 return super().apply(func, *args, **kwargs)
-#             return self._idf._apply_with_compiled_func(func, self._idf.to_numpy(), *args, **kwargs)
-#         except Exception as e:
-#             logger.warning(f'Error in pandoptResampler apply: {e}')
-#             return super().apply(func, *args, **kwargs)
+def agg_std(z):
+    return np.std(z)
 
-# @make_class_decorator(autowrap_pandas_return)
-# class pandoptExpanding(pd.core.window.expanding.Expanding):
-#     _outside_call = True
-#     def __init__(self, df, *args, **kwargs):
-#         self._idf = df
-#         super().__init__(df, *args, **kwargs)
+def agg_sum(z):
+    return np.sum(z)
 
-#     def agg(self, func, *args, **kwargs):
-#         if isinstance(func, dict):
-#             results = {col: (super().agg({col: f}) if f in ['mean', 'std', 'sum', 'min', 'max', 'count', 'median'] else self.apply(lambda x: x[col].pipe(f), *args, **kwargs)) for col, f in func.items()}
-#             return pandopt(results)
-#         elif func in ['mean', 'std', 'sum', 'min', 'max', 'count', 'median']:
-#             return super().agg(func, *args, **kwargs)
-#         else:
-#             return self.apply(func, *args, **kwargs)
+def agg_custom(z):
+    if z['A',-1] > z['B',0]:
+        return np.median(z['C']) - np.std(np.log(z))
+    return np.mean(z["C"]) / 2 / np.std(z)
 
-#     def apply(self, func, *args, pandas_fallback=False, **kwargs):
-#         try:
-#             if pandas_fallback:
-#                 return super().apply(func, *args, **kwargs)
-#             return self._idf._apply_with_compiled_func(func, self._idf.to_numpy(), *args, **kwargs)
-#         except Exception as e:
-#             logger.warning(f'Error in pandoptExpanding apply: {e}')
-#             return super().apply(func, *args, **kwargs)
+if __name__ == '__main__':
+
+        
+    pandas_df = pd.DataFrame(np.random.randn(10000, 4), columns=['A', 'B', 'C', 'D']).astype(np.float32)
+    pandopt_df = pandopt(pandas_df)
+
+    a = pandas_df.agg(agg_sum, axis=1).rolling(25).apply(agg_sum)
+    a2 = pandas_df.sum(axis=1).rolling(25).sum()
+    b = pandopt_df.rolling(25).apply(agg_sum, axis=1)
+
+    print(np.sum(a.dropna().values), np.sum(a2.dropna().values), np.sum(b.values))
+
+
+    a = pandas_df.rolling(25).apply(agg_sum)
+    a2 = pandas_df.rolling(25).sum()
+    b = pandopt_df.rolling(25).apply(agg_sum, axis=1)
+
+    print(np.sum(a.dropna().values), np.sum(a2.dropna().values), np.sum(b.values))
+
+    pandas_df = pd.DataFrame(np.random.randn(10000, 4), columns=['A', 'B', 'C', 'D']).astype(np.float32)
+    pandopt_df = pandopt(pandas_df)
+    print(pandopt_df.apply(agg_sum, axis=1))
+    print(pandopt_df.rolling(25).apply(agg_sum, axis=1))
+    print(pandas_df.rolling(25).apply(agg_sum))
 
