@@ -28,7 +28,7 @@ def test_func(z):
 ```
 Into this one for the loop method:
 ```python
-@nb.jit(nopython=True, nogil=True, parallel=True)
+@nb.jit(nopython=True, nogil=True, parallel=True, OTHER flags...)
 def cdmtest_func(Z):
     def callmap(x):
         if x == 'A':

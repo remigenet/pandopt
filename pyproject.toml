@@ -1,0 +1,14 @@
+[tool.poetry]
+name = "pandopt"
+version = "0.2"
+description = "blazzing fast ligthweight pandas wrapper"
+authors = ["remigenetaplo <remi.genet@aplo.io>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.12"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

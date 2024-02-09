@@ -124,7 +124,7 @@ def {func_int_identifier}_vectorized(Z):
     return original_tree, loop_func_tree, vectorize_func_tree
 
 def numba_decorate(func_tree: ast.AST, nopython: bool = True, nogil: bool = True, parallel: bool = True,
- fastmath: bool = True, forceinline: bool = True, looplift: bool = True, target_backend: bool = True, no_cfunc_wrapper: bool = True) -> ast.AST:
+ fastmath: bool = True, forceinline: bool = True, looplift: bool = True, target_backend: bool = True, no_cfunc_wrapper: bool = True, cache: bool = True) -> ast.AST:
     # # Add Numba JIT decorator
     nb_compyled_func_tree = copy.deepcopy(ast.fix_missing_locations(func_tree))
     numba_decorator = ast.Call(
@@ -138,7 +138,8 @@ def numba_decorate(func_tree: ast.AST, nopython: bool = True, nogil: bool = True
             ast.keyword(arg='forceinline', value=ast.Constant(value=forceinline)),
             ast.keyword(arg='looplift', value=ast.Constant(value=looplift)),
             ast.keyword(arg='target_backend', value=ast.Constant(value=target_backend)),
-            ast.keyword(arg='no_cfunc_wrapper', value=ast.Constant(value=no_cfunc_wrapper))
+            ast.keyword(arg='no_cfunc_wrapper', value=ast.Constant(value=no_cfunc_wrapper)),
+            # ast.keyword(arg='cache', value=ast.Constant(value=cache))
         ]
     )
     nb_compyled_func_tree.body[0].decorator_list.append(numba_decorator)
@@ -160,12 +161,13 @@ def compile_tree(built_func_tree: ast.AST, exec_globals: Dict[str, Any], qualnam
 
 
 def _prepare_funcs(original_func: ast.AST, mapping: Dict[str, int], func_int_identifier: str, D3_to_D2: bool = False, no_vectorized = False) -> Dict[str, Callable]:
+    available_funcs = {'original': original_func}
+    
     exec_globals = globals().copy()
     exec_globals.update({'np': np, 'nb': nb})
     callmap_func_ast = create_callmap_function_ast(mapping)
     callmap_func_tree = ast.fix_missing_locations(ast.Module(body=[callmap_func_ast], type_ignores=[]))
     original_tree, loop_func_tree, vectorize_func_tree = create_transformed_function_ast(original_func, mapping, func_int_identifier, D3_to_D2 = D3_to_D2)
-    available_funcs = {}
 
     loop_func_tree = encapulate(loop_func_tree, callmap_func_tree, original_tree)
     available_funcs.update(compile_tree(loop_func_tree, exec_globals, func_int_identifier, '_loop'))
@@ -183,8 +185,6 @@ def _prepare_funcs(original_func: ast.AST, mapping: Dict[str, int], func_int_ide
     available_funcs.update(compile_tree(nb_compyled_loop_func_tree, exec_globals, func_int_identifier, '_loop_nb_compyled'))
 
     return available_funcs
-
-
 
 
 def standard_sum(z):
@@ -207,7 +207,6 @@ def standard_median(z):
 
 def standard_count(z):
     return np.count(z)
-
 
 
 class StandardFunctions(Enum):
@@ -316,18 +315,19 @@ class pandopt(pd.DataFrame):
     def __name__(self):
         return 'fid' + functools.reduce(laapply_benchmarks-Copy1(lambda x, y: f'{x}&{y}', mapper) + func_qualifier)
 
-    def apply(self, func, axis = 1, *args, pandas_fallback = False, data = None, new_index = None, from_rolling  = False, **kwargs):
+    def apply(self, func, axis = None, *args, pandas_fallback = False, data = None, new_index = None, from_rolling  = False, **kwargs):
         if pandas_fallback or args or kwargs: 
             logger.warning(f'{__class__} {"finish in pandas fallback for func "+func if pandas_fallback else "apply only supports func and axis arguments, using default pandas apply"}')
             return super().apply(func, axis = axis, *args, **kwargs)
+        if axis is None:
+            self.apply(func, axis = 1, *args, pandas_fallback = False, data = None, new_index = None, from_rolling = from_rolling, **kwargs).apply(func, axis = 1, *args, pandas_fallback = False, data = None, new_index = None, from_rolling = from_rolling, **kwargs)
         new_columns = None
+        mapping = self.colname_to_colnum if axis == 0 else {True: 0}
         if from_rolling:
-            mapping = self.colname_to_colnum if axis == 0 else {True: 0}
             test_set = data[:min(data.shape[0] - 1, 10+ len(self.index) - len(new_index)),:,:]
             new_columns = self.columns if axis == 0 else None
         else:
             data =  (self.to_numpy() if axis else self.to_numpy().T)
-            mapping = self.colname_to_colnum if axis == 0 else self.rowname_to_rownum
             test_set = data[:min(data.shape[0] - 1, 10)]
             new_index = self.index if axis == 1 else self.columns
 
@@ -347,21 +347,24 @@ class pandopt(pd.DataFrame):
         def _with_protects(*args, **kwargs):
             for key in ('_vectorized_nb_compyled', '_loop_nb_compyled', '_vectorized', '_loop'):
                 if key not in self.__class__._compiled_func[func_int_identifier]:
+                    logger.debug(f'No {key} for {func_int_identifier}')
                     continue
                 try:
                     result = self.__class__._compiled_func[func_int_identifier][key](*args, **kwargs)
                     if np.shape(result):
+                        logger.debug(f"returning {result} with {self.__class__._compiled_func[func_int_identifier][key]}")
                         return result
                     else:
+                        logger.debug(f'Encountered {key} with not untented result {np.shape(result)} -> {result}')
                         self.__class__._compiled_func[func_int_identifier].pop(key)
                 except Exception as e:
-                    print('Encountered', e)
+                    logger.warning('Encountered', e)
                     self.__class__._compiled_func[func_int_identifier].pop(key)
-            return self.apply(*args, pandas_fallback = True, **kwargs)
+            return self.apply(func = self.__class__._compiled_func['original'], *args, pandas_fallback = True, **kwargs)
         return _with_protects
 
     def _compiled_qualifier(self, func_qualifier, mapper, D3_to_D2: bool = False, no_vectorized = False):
-        return 'fid'+ f'D3_to_D2_{no_vectorized}' +f'D3_to_D2_{D3_to_D2}' + str(functools.reduce(lambda x, y: x+y, mapper.keys())) + func_qualifier
+        return 'fid'+ f'nvct{no_vectorized}' +f'D3_to_D2_{D3_to_D2}' + str(functools.reduce(lambda x, y: x+y, mapper.keys())) + func_qualifier
 
     
     def _build_apply_versions(self, func, mapping, func_int_identifier, D3_to_D2: bool = False, no_vectorized = False):
@@ -403,7 +406,6 @@ class pandoptRoll(pd.core.window.rolling.Rolling):
         self._idf = pandopt(df) if not isinstance(df, pandopt) else df
         super().__init__(self._idf, window=window, *args, **kwargs)
 
-
     def apply(self, func, axis = 0, *args, pandas_fallback=False, raw = True, **kwargs):
         try:
             data = sliding_window_view(self._idf.to_numpy(), self.window, axis=0)
@@ -414,9 +416,8 @@ class pandoptRoll(pd.core.window.rolling.Rolling):
             if pandas_fallback:
                 return super().apply(func, *args, **kwargs)
             raise e
-            
     
-    def agg(self, func, *args, **kwargs):
+    def aggregate(self, func, *args, **kwargs):
         if isinstance(func, dict):
             result = {}
             for column, func in func.items():
@@ -426,7 +427,9 @@ class pandoptRoll(pd.core.window.rolling.Rolling):
         func = load_function(func)
         return self.apply(func, *args, **kwargs)
 
-        
+    def agg(self, func, *args, **kwargs):
+        return self.aggregate(func, *args, **kwargs)
+  
     def __getattr__(self, name):
         def wrapper(*args, **kwargs):
             try:
@@ -437,61 +440,4 @@ class pandoptRoll(pd.core.window.rolling.Rolling):
         return wrapper
     
 
-import pandas as pd
-import numpy as np
-import tqdm 
-import pandas as pd
-import numpy as np
-import timeit
-import functools
-import time
-
-
-def agg_sum(z):
-    return np.sum(z)
-
-def agg_mean(z):
-    return np.mean(z)
-
-def agg_max(z):
-    return np.max(z)
-
-def agg_min(z):
-    return np.min(z)
-
-def agg_std(z):
-    return np.std(z)
-
-def agg_sum(z):
-    return np.sum(z)
-
-def agg_custom(z):
-    if z['A',-1] > z['B',0]:
-        return np.median(z['C']) - np.std(np.log(z))
-    return np.mean(z["C"]) / 2 / np.std(z)
-
-if __name__ == '__main__':
-
-        
-    pandas_df = pd.DataFrame(np.random.randn(10000, 4), columns=['A', 'B', 'C', 'D']).astype(np.float32)
-    pandopt_df = pandopt(pandas_df)
-
-    a = pandas_df.agg(agg_sum, axis=1).rolling(25).apply(agg_sum)
-    a2 = pandas_df.sum(axis=1).rolling(25).sum()
-    b = pandopt_df.rolling(25).apply(agg_sum, axis=1)
-
-    print(np.sum(a.dropna().values), np.sum(a2.dropna().values), np.sum(b.values))
-
-
-    a = pandas_df.rolling(25).apply(agg_sum)
-    a2 = pandas_df.rolling(25).sum()
-    b = pandopt_df.rolling(25).apply(agg_sum, axis=1)
-
-    print(np.sum(a.dropna().values), np.sum(a2.dropna().values), np.sum(b.values))
-
-    pandas_df = pd.DataFrame(np.random.randn(10000, 4), columns=['A', 'B', 'C', 'D']).astype(np.float32)
-    pandopt_df = pandopt(pandas_df)
-    print(pandopt_df.apply(agg_sum, axis=1))
-    print(pandopt_df.rolling(25).apply(agg_sum, axis=1))
-    print(pandas_df.rolling(25).apply(agg_sum))
 
