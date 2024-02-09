@@ -1,6 +1,25 @@
 # Pandopt
 pandas light wrapper class for improved performance
 
+## How to get it ?
+
+Pandopt is available with pip command, you can install it with:
+```bash
+pip install pandopt
+```
+
+and then use it as simply as:
+```python
+import pandopt as pd
+```
+or
+```python
+from pandopt import pandopt
+...
+df = pd.DataFrame(...) # doing your usual pandas stuff  
+#then needing to use the apply method for example
+pandopt(df).apply(...).to_pandas() # to get back to normal pandas
+```
 ## What it is ?
 Pandopt is a lightweight library that only aims to improve pandas efficiency in certain methods, while keeping the user API totally the same.
 
@@ -81,9 +100,9 @@ def cdmtest_func(Z):
             return 3
         return x
     def tmporary(x):
-        x = (z['A']+z['B'])
-        x = z['B']*z['D']
-        return x / z['B']
+        x = (z[callmap('A')]+z[callmap('B')])
+        x = z[callmap('B')]*z[callmap('D')]
+        return x / z[callmap('B')]
     n = Z.shape[0]
     res = np.zeros((n, 1))
     for i in nb.prange(5, n):

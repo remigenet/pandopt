@@ -286,6 +286,10 @@ def autowrap_pandas_return(fn: Callable) -> Callable:
             res = fn(self, *args, **kwargs)
             if isinstance(res, pd.DataFrame):
                 res = pandopt(res)
+            elif isinstance(res, pd.core.window.rolling.Rolling):
+                res = pandoptRoll(res)
+            elif isinstance(res, pandas.core.groupby.generic.DataFrameGroupBy):
+                res = pandoptGroup(res)
             self._outside_call = True
             return res
         return fn(self, *args, **kwargs)
@@ -377,16 +381,15 @@ class pandopt(pd.DataFrame):
 
     
     def groupby(self, *args, **kwargs):
-        raise NotImplementedError('Expanding not yet implemented')
-        return pandoptGroupBy(self, *args, **kwargs)
+        return pandoptGroup(self, *args, **kwargs)
 
     def resample(self, *args, **kwargs):
-        raise NotImplementedError('Expanding not yet implemented')
-        return pandoptResampler(self, *args, **kwargs)
+        # NotImplementedError('Expanding not yet implemented')
+        return super().resample(*args, **kwargs)
 
     def expanding(self, *args, **kwargs):
-        raise NotImplementedError('Expanding not yet implemented')
-        return pandoptExpanding(self, *args, **kwargs)
+        # NotImplementedError('Expanding not yet implemented')
+        return super().expanding(*args, **kwargs)
 
         
     def __getattr__(self, name):
@@ -440,4 +443,44 @@ class pandoptRoll(pd.core.window.rolling.Rolling):
         return wrapper
     
 
+@make_class_decorator(autowrap_pandas_return)
+class pandoptGroup(pd.core.groupby.generic.DataFrameGroupBy):
+    _outside_call = True
+    def __init__(self, df, *args, **kwargs):
+        self.index = np.range(df.shape[0])
+        self._idf = pandopt(df) if not isinstance(df, pandopt) else df
+        super().__init__(self._idf, *args, **kwargs)
 
+    def apply(self, func, axis = 0, *args, pandas_fallback=False, raw = True, **kwargs):
+        try:
+            data = sliding_window_view(self._idf.to_numpy(), self.window, axis=0)
+            r = self._idf.apply(func, axis = axis, *args, data = data, pandas_fallback=pandas_fallback, new_index =self._idf.index[self.window-1:], from_rolling = True,**kwargs)
+            return r#.reindex(self._idf.index, axis=0)
+        except Exception as e:
+            logger.warning(f'Error in pandoptRoll apply: {e}')
+            if pandas_fallback:
+                return super().apply(func, *args, **kwargs)
+            raise e
+    
+    def aggregate(self, func, *args, **kwargs):
+        if isinstance(func, dict):
+            result = {}
+            for column, func in func.items():
+                func = load_function(func)  # CAN BE IMPROVED MUCH
+                result[column] = self.apply(lambda x: x[column].pipe(func_name), *args, **kwargs)
+            return pandopt(result)
+        func = load_function(func)
+        return self.apply(func, *args, **kwargs)
+
+    def agg(self, func, *args, **kwargs):
+        return self.aggregate(func, *args, **kwargs)
+  
+    def __getattr__(self, name):
+        def wrapper(*args, **kwargs):
+            try:
+                func = load_function(name)  
+            except AttributeError:
+                raise AttributeError(f"{name} not found or could not be loaded.")
+            return self.apply(func=func, *args, **kwargs)
+        return wrapper
+    
