@@ -6,7 +6,7 @@ from numpy.lib.stride_tricks import sliding_window_view
 logger = logging.getLogger()
 logger.setLevel(0)
 import pandopt
-from pandopt.transfcoders import _prepare_funcs
+from .transfcoders import _prepare_funcs
 
 class GroupOpt(DataFrameGroupBy):
     _outside_call = True

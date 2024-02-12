@@ -6,7 +6,7 @@ from typing import Callable, Type, Dict, Tuple, Any
 logger = logging.getLogger()
 logger.setLevel(0)
 import pandopt
-from pandopt.transfcoders import _prepare_funcs
+from .transfcoders import _prepare_funcs
 
 class DataFrame(pandas.DataFrame):
     _compiled_func = {}
