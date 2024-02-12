@@ -19,10 +19,6 @@ class DataFrame(pandas.DataFrame):
         super().__init__(*args, **kwargs)
         # if self.dtypes:
 
-    def __getitem__(self, name):
-        print(name)
-        return super().__getitem__(name)
-
     def to_pandas(self):
         return pandas.DataFrame(self)
 
