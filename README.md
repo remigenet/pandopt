@@ -11,14 +11,15 @@ pip install pandopt
 and then use it as simply as:
 ```python
 import pandopt as pd
+#here everything work as usual, pd.Timestamp will work as usual, pd.DataFrame too but this one will returns a pandopt defined DataFrame !
 ```
 or
 ```python
-from pandopt import pandopt
+import pandopt as pdo
 ...
 df = pd.DataFrame(...) # doing your usual pandas stuff  
 #then needing to use the apply method for example
-pandopt(df).apply(...).to_pandas() # to get back to normal pandas
+pdo.DataFrame(df).apply(...).to_pandas() # to get back to normal pandas
 ```
 ## What it is ?
 Pandopt is a lightweight library that only aims to improve pandas efficiency in certain methods, while keeping the user API totally the same.
