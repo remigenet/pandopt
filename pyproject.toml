@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "pandopt"
-version = "0.2"
+version = "0.21"
 description = "blazzing fast ligthweight pandas wrapper"
 authors = ["remigenetaplo <remi.genet@aplo.io>"]
 readme = "README.md"

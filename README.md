@@ -15,6 +15,7 @@ import pandopt as pd
 ```
 or
 ```python
+import pandas as pd
 import pandopt as pdo
 ...
 df = pd.DataFrame(...) # doing your usual pandas stuff  
@@ -62,8 +63,8 @@ You can find the benchmarks in the demos_n_examples folder, where pandopt librar
 
 ## What works now ?
 
-Apply methods start to be well tested and the rolling window method is seems to integrate well too. The groupby method is still in development and may change but are already very performant.
-Tests and benchmarks are available at:
+Apply methods start to be well tested and the rolling window method is integration is done too. After multiple tests, either using numpy memory layout, pyarrow indexing, and numba, improving the groupby outside of the box seems much more complicated than expected and this is not planned for the moment.
+However you can find tests and benchmarks in notebooks:
     - [Apply function in Notebook](demos_n_examples/apply_benchmarks.ipynb)
     - [Apply function in Notebook](demos_n_examples/rolling_benchmarks.ipynb)
   
@@ -73,6 +74,19 @@ Tests and benchmarks are available at:
 Pandopt idea is to be as general as posisible, and to be as compatible as possible with the pandas API. It's also to be as light as possible, and to not add any dependencies that are not strictly necessary. In that meaning it only requires the numpy and numba library for optimisation, that are not from standard library, but are very common and very well maintained. 
 pandopt class directly inherit from pandas class, and is not meant to be used as a standalone library, but as a drop-in replacement for pandas, so it's versioning is directly linked to the pandas versioning, and it's compatibility is directly linked to the pandas compatibility.
 In addition to inherit, it use decorators to avoid "leaving" the class, and to ensure that the methods are not overriden by the pandas methods, and that the class is not overriden by the pandas class.
+
+## Ideas tested
+
+Multiple ideas have been tested and compared to provide this package, here is a summary of them, that can be tricks you use for other purpose:
+    - Memory layout:
+        - Numpy strenght when it come to calculation comes from contiguity. What this means is that the datas inside an array are all "packed" together. 
+        - However memory isn't 2 or 3 dimensional, it's 1 dimensional, and thus the way it is saved matters.
+        - In numpy you can check any array contiguity with .flags which will tell you wether it is a pointer to raw datas, C-contiguous datas or F-contiguous datas
+        - C-contiguous means for a 2D matrix that datas are saved in a row fashion, while F-contiguous (for Fortran) means in a columnar way. 
+            - This can be change using array.copy(order='C') or .copy(order='F')
+            - Over standards numpy arrays this matters a lot even for basic operations, you can find some examples [here](dev/apply_contiguity_tests.ipynb)
+            - However, if you use your array inside numba, even if you can tell to numba the specific contiguity, the choice of it doens't have any real impact on performance
+        - For rolling a known tricks used is the numpy strides tricks, which consists of using strides to obtain a view over the numpy arrays. Strides are a low-level way to create pointer over the raw array, but needs meticulous manipulation to work with. However numpy comes with sliding_window_view in  numpy.lib.stride_tricks that helps manipulate the arrays safely in this contexts. 
 
 ## How it works for apply ?
 
@@ -119,7 +133,10 @@ For rolling Pandopt leverage the numpy API too with, using sliding_window_view f
 It use the same method as apply to create the function, and then use the view to apply it on the array.
 It also add the axis parameter to the rolling method, that is not present in pandas, to allow to apply the rolling on the axis 1, and not only on the axis 0.
 
-## How it works for Groupby ?
 
-Not implemented yet, coming soon
+## Things to come:
 
+For now nothing more is to except from pandopt in terms of implementations, but any improvments of the library, proposal or issue report is welcome.
+You can look at the small tests notebooks that were just drafts of tests before implementation in dev.
+- aggregate will probably be implemented (a part of the idea already done [here](dev/grouptest.ipynb))
+- default numba engine use for groupby might come as in beginning of the same file too.

@@ -33,7 +33,7 @@ RUN pipx run poetry add numba
 COPY ./ /pandopt/
 
 WORKDIR /pandopt
-RUN pipx run poetry config pypi-token.pypi pypi-AgEIcHlwaS5vcmcCJDFiY2NjNzcwLWFmZDgtNDU4OS1iZjg0LTc1MjI1OTVlOGM0MwACKlszLCJkZDhkZjA4Ni0yN2UxLTRmNjEtYWZhNi1hMjc5N2MzNWU3YWIiXQAABiAf0GtvByTUtkF3pZhELDtQ3RZB_GceYI-Y0QubcFv7aA
-RUN pipx run poetry build
-RUN pipx run poetry publish
+# RUN pipx run poetry config pypi-token.pypi get_pypy_token()
+# RUN pipx run poetry build
+# RUN pipx run poetry publish
 
