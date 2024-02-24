@@ -6,17 +6,18 @@ import functools
 import sys
 from typing import Callable, Type, Dict, Tuple, Any, Union
 import numpy as np
+from functools import reduce
 import numba as nb
 import hashlib
 logger = logging.getLogger()
 logger.setLevel(0)
+import pandopt
 
 
 
-
-def source_parser(f, *, mapping):
+def source_parser(f):
     source = inspect.getsource(f)
-    if any(source.startswith(managed_method.__name__) for managed_method in [apply, aggregate, myparser_func]):
+    if any(source.startswith(managed_method.__name__) for managed_method in [pandopt.DataFrame.apply, pandopt.DataFrame.aggregate, source_parser]):
         code = "    return " + source[source.find('x:') + 2:source.find('mapping')].strip().strip(',').strip(':').strip(')')
     elif f.__module__ != '__main__':
         code = "    import " + f.__module__ + '\n'
@@ -87,7 +88,7 @@ def create_callmap_function_ast(mapping: Dict[str, int]) -> ast.FunctionDef:
             )
         ],
         keywords=[
-            ast.keyword(arg='cache', value=ast.Constant(value=True)),
+            ast.keyword(arg='cache', value=ast.Constant(value=False)),
             ast.keyword(arg='parallel', value=ast.Constant(value=True)),
             ast.keyword(arg='fastmath', value=ast.Constant(value=True)),
             ast.keyword(arg='forceinline', value=ast.Constant(value=True)),
@@ -117,6 +118,8 @@ def create_callmap_function_ast(mapping: Dict[str, int]) -> ast.FunctionDef:
         returns=None
     )
     return func_def, callmap_name
+
+
 class SubscriptReplacer(ast.NodeTransformer):
     """
     AST Node Transformer to replace subscript expressions in a function's AST.
@@ -158,6 +161,7 @@ class SubscriptReplacer(ast.NodeTransformer):
         self.callmap_name = callmap_name
         self.axis = axis
         self.ndims = ndims
+        self.used = False
 
     def visit_Subscript(self, node):
         if isinstance(node.value, ast.Name) and node.value.id == self.arg_name:
@@ -178,11 +182,13 @@ class SubscriptReplacer(ast.NodeTransformer):
                         keywords=[]
                     ) for i in range(self.ndims)],
                ctx=ast.Load())
+            self.used = True
             # Wrap the subscript in a call to callmap
         return self.generic_visit(node) 
 
 
-def create_transformed_function_ast(original_func: Callable, callmap_name, axis = 0, ndims = 2, D3_to_D2: bool = False, no_vectorized: bool = False) -> Tuple[ast.AST, ast.AST, ast.AST]:
+
+def create_transformed_function_ast(original_func: Callable, mapping: Dict[str, np.int32], axis: int = 0, ndims: int = 2, dtype: str = 'float32') -> Tuple[ast.AST, ast.AST, ast.AST]:
     """
     Create transformed versions of a given function as abstract syntax trees (ASTs).
 
@@ -214,65 +220,219 @@ def create_transformed_function_ast(original_func: Callable, callmap_name, axis 
     >>> mapping = {'x': 0}
     >>> func_ast, loop_ast, vector_ast = create_transformed_function_ast(original_function, mapping, 'func_id')
     """
-    
+    print(f'BUILDING WITH AXIS={axis} - ndims={ndims}')
     # Parse the original function
     source_code = source_parser(original_func)
     original_tree = ast.parse(source_code)
-    
+    hash_name = hashlib.sha1(str(reduce(lambda x, y: str(x) + str(y), mapping.keys())).encode('UTF-8')).digest().hex()
+    if mapping:
+        callmap_name=f'callmap{hash_name}'
+    else:
+        callmap_name = 'NoCallMap'
+    uid = f'f{original_func.__qualname__}{hash_name}'
     arg_name = original_tree.body[0].args.args[0].arg
     original_tree.body[0].name = f'f{uid}'
     replacer = SubscriptReplacer(arg_name, callmap_name, axis = axis, ndims = ndims)
-    if "if" not in original_func:
+    
+    results = []
+
+    if "if" not in source_code:
 
         vectorize_tree = copy.deepcopy(original_tree)
         vectorize_tree = replacer.visit(vectorize_tree)
         ast.fix_missing_locations(vectorize_tree)
         
         vectorize_tree_opt = copy.deepcopy(vectorize_tree)
-        vectorize_tree.body[0].name += '_vectorized'
-        vectorize_tree_opt.body[0].name += '_vectorized_opt'
+        vectorize_tree.body[0].name = 'vectorized'
+        vectorize_tree_opt.body[0].name = 'vectorized_opt'
         vectorize_tree_opt = numba_decorate(vectorize_tree_opt)
+        results += [vectorize_tree, vectorize_tree_opt]
 
+    if ndims == 1:
+        
+        loop_tree = copy.deepcopy(original_tree)
+        loop_tree_opt = copy.deepcopy(loop_tree)
+        loop_tree.body[0].name = 'loop'
+        loop_tree_opt.body[0].name = 'loop_opt'
+        loop_tree_opt = numba_decorate(loop_tree_opt)
+        return results + [loop_tree, loop_tree_opt]
 
     if ndims == 2:
+        
+        if axis == 0:
+            loop_tree = copy.deepcopy(original_tree)
+            loop_tree = replacer.visit(loop_tree)
+            ast.fix_missing_locations(loop_tree)
+            
+            loop_tree_opt = copy.deepcopy(loop_tree)
+            loop_tree.body[0].name += '_built__uloop_1'
+            loop_tree_opt.body[0].name += '_built__uloop_opt_1'
+            loop_tree_opt = numba_decorate(loop_tree_opt)
+            loop_tree = ast.parse(ast.unparse(loop_tree) + f"""
+def f{uid}_loop_1(Z, z, k):
+    for i in nb.prange(k):
+        z[i] = f{uid}_built__uloop_1(Z[i,:])
+
+def loop(Z):
+    k=Z.shape[0]
+    z=np.zeros(k, dtype=np.{dtype})
+    f{uid}_loop_1(Z, z, k)
+    return z
+        """)
+            loop_tree_opt = ast.parse(ast.unparse(loop_tree_opt) + f"""
+@nb.njit((nb.{dtype}[:,:], nb.{dtype}[:], nb.uint32), cache = False, parallel=True, fastmath=True, forceinline=True, looplift=True, inline='always', target_backend='host', no_cfunc_wrapper=True, no_rewrites=True, nogil=True)
+def f{uid}_loop_opt_1(Z, z, k):
+    for i in nb.prange(k):
+        z[i] = f{uid}_built__uloop_opt_1(Z[i,:])
+
+@nb.njit(nb.{dtype}[:](nb.{dtype}[:,:]),cache = False, parallel=True, fastmath=True, forceinline=True, looplift=True, inline='always', target_backend='host', no_cfunc_wrapper=True, no_rewrites=True, nogil=True)
+def loop_opt(Z):
+    k=np.uint32(len(Z))
+    z=np.zeros(k , dtype=np.{dtype})
+    f{uid}_loop_opt_1(Z, z, k)
+    return z
+            """)
+            return results + [loop_tree, loop_tree_opt]
+        if axis == 1:
+            loop_tree = copy.deepcopy(original_tree)
+            loop_tree = replacer.visit(loop_tree)
+            ast.fix_missing_locations(loop_tree)
+                
+            loop_tree_opt = copy.deepcopy(loop_tree)
+            loop_tree.body[0].name += '_built__uloop_1'
+            loop_tree_opt.body[0].name += '_built__uloop_opt_1'
+            loop_tree_opt = numba_decorate(loop_tree_opt)
+            loop_tree = ast.parse(ast.unparse(loop_tree) + f"""
+def f{uid}_loop_1(Z, z, k):
+    for i in nb.prange(k):
+        z[i] = f{uid}_built__uloop_1(Z[:,i])
+
+@nb.njit(nb.{dtype}[:](nb.{dtype}[:,:]),cache = False, parallel=True, fastmath=True, forceinline=True, looplift=True, inline='always', target_backend='host', no_cfunc_wrapper=True, no_rewrites=True, nogil=True)
+def f{uid}_loop_opt_1(Z):
+    z=np.zeros(Z.shape[0], dtype=np.{dtype})
+    for i in nb.prange(k):
+        z[i] = f{uid}_built__uloop_opt_1(Z[i,:])
+
+@nb.njit(nb.{dtype}[:](nb.{dtype}[:,:]),cache = False, parallel=True, fastmath=True, forceinline=True, looplift=True, inline='always', target_backend='host', no_cfunc_wrapper=True, no_rewrites=True, nogil=True)
+def loop_opt(Z):
+    k=np.uint32(len(Z))
+    z=np.zeros(k , dtype=np.{dtype})
+    f{uid}_loop_opt_1(Z, z, k)
+    return z
+        """)
+
+            return results + [loop_tree, loop_tree_opt]
+        elif axis is None:
+            return results
+
+    elif dim == 3:
+            
+        if axis == 0:
+            loop_tree = copy.deepcopy(original_tree)
+            loop_tree = replacer.visit(loop_tree)
+            ast.fix_missing_locations(loop_tree)
+            
+            loop_tree_opt = copy.deepcopy(loop_tree)
+            loop_tree.body[0].name += '_built__uloop_1'
+            loop_tree_opt.body[0].name += '_built__uloop_opt_1'
+            loop_tree_opt = numba_decorate(loop_tree_opt)
+            loop_tree = ast.parse(ast.unparse(loop_tree) + f"""
+def f{uid}_loop_1(Z, z, k):
+    for i in nb.prange(k):
+        z[i, :] = f{uid}_built__uloop_1(Z[i,:,:])
+
+def loop(Z):
+    z=np.zeros(Z.shape[1], dtype=np.{dtype})
+    f{uid}_loop_1(Z, z, k)
+    return z
+        """)
+        loop_tree_opt = ast.parse(ast.unparse(loop_tree_opt) + f"""
+@nb.njit((nb.{dtype}[:,::], nb.{dtype}[:], nb.uint32), cache = False, parallel=True, fastmath=True, forceinline=True, looplift=True, inline='always', target_backend='host', no_cfunc_wrapper=True, no_rewrites=True, nogil=True)
+def f{uid}_loop_opt_1(Z, z, k):
+    for i in nb.prange(k):
+        z[i, :] = f{uid}_built__uloop_opt_1(Z[i,:,:])
+
+@nb.njit(nb.{dtype}[:](nb.{dtype}[:,::]),cache = False, parallel=True, fastmath=True, forceinline=True, looplift=True, inline='always', target_backend='host', no_cfunc_wrapper=True, no_rewrites=True, nogil=True)
+def loop_opt(Z):
+    k=np.uint32(len(Z))
+    z=np.zeros(k , dtype=np.{dtype})
+    f{uid}_loop_opt_1(Z, z, k)
+    return z
+            """)
+        results += [loop_tree, loop_tree_opt]
+    if axis == 1:
         loop_tree = copy.deepcopy(original_tree)
         loop_tree = replacer.visit(loop_tree)
         ast.fix_missing_locations(loop_tree)
         
         loop_tree_opt = copy.deepcopy(loop_tree)
-        loop_tree.body[0].name += '_uloop_1'
-        loop_tree_opt.body[0].name += '_uloop_1_opt'
+        loop_tree.body[0].name += '_built__uloop_1'
+        loop_tree_opt.body[0].name += '_built__uloop_opt_1'
         loop_tree_opt = numba_decorate(loop_tree_opt)
-        loop_tree = ast.unparse(loop_tree) + f"""
-def f{uid}_loop_1(Z, res):
-    for i in nb.prange(n):
-        res[i] = f{uid}_uloop_1(Z[i])
+        loop_tree = ast.parse(ast.unparse(loop_tree) + f"""
+def f{uid}_loop_1(Z, z, k):
+    for i in nb.prange(k):
+        z[i, :] = f{uid}_built__uloop_1(Z[:,i,:])
 
-def f{uid}_loop(Z):
-    z=np.zeros(len(Z), dtype=Z.dtype)
-    f{uid}_loop_1(Z, z)
+def loop(Z):
+    z=np.zeros(Z.shape[1], dtype=np.{dtype})
+    f{uid}_loop_1(Z, z, k)
     return z
-        """
-        loop_tree_opt = ast.unparse(loop_tree_opt) + f"""
-@nb.jit(cache = True, parallel=True, fastmath=True, forceinline=True, looplift=True, inline='always', target_backend='host', no_cfunc_wrapper=True, no_rewrites=True ,nopython=True, nogil=True)
-def f{uid}_loop_opt_1(Z, res):
-    for i in nb.prange(n):
-        res[i] = f{uid}_uloop_opt_1(Z[i])
+        """)
+        loop_tree_opt = ast.parse(ast.unparse(loop_tree_opt) + f"""
+@nb.njit((nb.{dtype}[:,:], nb.{dtype}[:], nb.uint32), cache = False, parallel=True, fastmath=True, forceinline=True, looplift=True, inline='always', target_backend='host', no_cfunc_wrapper=True, no_rewrites=True, nogil=True)
+    def f{uid}_loop_opt_1(Z, z, k):
+    for i in nb.prange(k):
+        z[i, :] = f{uid}_built__uloop_opt_1(Z[:,i,:])
 
-@nb.jit(cache = True, parallel=True, fastmath=True, forceinline=True, looplift=True, inline='always', target_backend='host', no_cfunc_wrapper=True, no_rewrites=True ,nopython=True, nogil=True)
-def f{uid}_loop_opt(Z):
-    z=np.zeros(len(Z), dtype=Z.dtype)
-    f{uid}_loop_opt_1(Z, z)
+@nb.njit(nb.{dtype}[:](nb.{dtype}[:,::,:]),cache = False, parallel=True, fastmath=True, forceinline=True, looplift=True, inline='always', target_backend='host', no_cfunc_wrapper=True, no_rewrites=True, nogil=True)
+    def loop_opt(Z):
+        k=np.uint32(len(Z))
+        z=np.zeros(k , dtype=np.{dtype})
+        f{uid}_loop_opt_1(Z, z, k)
+        return z
+            """)
+
+        results += [loop_tree, loop_tree_opt]
+    if axis == 2:
+        loop_tree = copy.deepcopy(original_tree)
+        loop_tree = replacer.visit(loop_tree)
+        ast.fix_missing_locations(loop_tree)
+        
+        loop_tree_opt = copy.deepcopy(loop_tree)
+        loop_tree.body[0].name += '_built__uloop_1'
+        loop_tree_opt.body[0].name += '_built__uloop_opt_1'
+        loop_tree_opt = numba_decorate(loop_tree_opt)
+        loop_tree = ast.parse(ast.unparse(loop_tree) + f"""
+def f{uid}_loop_1(Z, z, k):
+    for i in nb.prange(k):
+        z[i, :] = f{uid}_built__uloop_1(Z[:,:,i])
+
+def loop(Z):
+    z=np.zeros(Z.shape[2], dtype=np.{dtype})
+    f{uid}_loop_1(Z, z, k)
     return z
-        """
+        """)
+        loop_tree_opt = ast.parse(ast.unparse(loop_tree_opt) + f"""
+@nb.njit((nb.{dtype}[:,:], nb.{dtype}[:], nb.uint32), cache = False, parallel=True, fastmath=True, forceinline=True, looplift=True, inline='always', target_backend='host', no_cfunc_wrapper=True, no_rewrites=True, nogil=True)
+    def f{uid}_loop_opt_1(Z, z, k):
+    for i in nb.prange(k):
+        z[i, :] = f{uid}_built__uloop_opt_1(Z[:,:,i])
 
-        return original_tree, loop_tree, vectorize_tree, loop_tree_opt, vectorize_tree_opt
+@nb.njit(nb.{dtype}[:](nb.{dtype}[:,::,:]),cache = False, parallel=True, fastmath=True, forceinline=True, looplift=True, inline='always', target_backend='host', no_cfunc_wrapper=True, no_rewrites=True, nogil=True)
+    def loop_opt(Z):
+        k=np.uint32(len(Z))
+        z=np.zeros(k , dtype=np.{dtype})
+        f{uid}_loop_opt_1(Z, z, k)
+        return z
+            """)
+        results += [loop_tree, loop_tree_opt]
+    if replacer.used:
+        callmap_func_tree, _ = create_callmap_function_ast(mapping)
+        results.insert(0, callmap_func_tree)
+    return results
 
 
-
-
-
-    return original_tree, loop_func_tree, vectorize_func_tree, loop_func_tree_oc, vectorize_func_tree_oc
 
 def numba_decorate(func_tree: ast.AST, nopython: bool = True, nogil: bool = True, parallel: bool = True, fastmath: bool = True, forceinline: bool = True, looplift: bool = True, target_backend: bool = True, no_cfunc_wrapper: bool = True, cache: bool = True) -> ast.AST:
     """
@@ -325,7 +485,7 @@ def numba_decorate(func_tree: ast.AST, nopython: bool = True, nogil: bool = True
             # )
         ],
         keywords=[
-            ast.keyword(arg='cache', value=ast.Constant(value=True)),
+            ast.keyword(arg='cache', value=ast.Constant(value=False)),
             ast.keyword(arg='parallel', value=ast.Constant(value=True)),
             ast.keyword(arg='fastmath', value=ast.Constant(value=True)),
             ast.keyword(arg='forceinline', value=ast.Constant(value=True)),
@@ -338,7 +498,6 @@ def numba_decorate(func_tree: ast.AST, nopython: bool = True, nogil: bool = True
         ]
     )
     nb_compyled_func_tree.body[0].decorator_list.append(numba_decorator)
-    nb_compyled_func_tree.body[0].name += '_nb_compyled'
     return ast.fix_missing_locations(nb_compyled_func_tree)
 
 def encapulate(compute_function: ast.AST, callmap_tree: ast.AST, original_tree: ast.AST) -> ast.AST:
@@ -414,12 +573,14 @@ def compile_tree(built_func_tree: ast.AST, exec_globals: Dict[str, Any], qualnam
     >>> compiled_funcs = compile_tree(func_tree, exec_globals, 'func', '_compiled')
     """
     try:
+        print(ast.unparse(built_func_tree))
         compyled = None
         def wrapped(x):
             nonlocal compyled
             if compyled is None:
+                print("COMPILADO",  ast.unparse(built_func_tree))
                 exec(compile(built_func_tree, filename="<ast>", mode="exec"), exec_globals)
-                compyled = exec_globals[qualname + build_qualifier]
+                compyled = exec_globals[build_qualifier]
             return compyled(x)
         return {build_qualifier: wrapped}
     except Exception as e:
@@ -427,7 +588,7 @@ def compile_tree(built_func_tree: ast.AST, exec_globals: Dict[str, Any], qualnam
         return {}
     
 
-def _prepare_funcs(original_func: Callable, mapping: Dict[str, int], func_int_identifier: str, D3_to_D2: bool = False, no_vectorized: bool = False) -> Dict[str, Callable]:
+def _prepare_funcs(original_func: Callable, mapping: Dict[str, int], func_int_identifier: str, ndims: int, axis: int, dtype:str = 'float32') -> Dict[str, Callable]:
     """
     Prepare and compile various versions of a function for optimized execution.
 
@@ -461,44 +622,20 @@ def _prepare_funcs(original_func: Callable, mapping: Dict[str, int], func_int_id
     >>> prepared_funcs = _prepare_funcs(original_function, mapping, 'func_id')
     """
     available_funcs = {'original': original_func}
-
-    asts = create_transformed_function_ast(original_func, mapping, func_int_identifier, D3_to_D2 = D3_to_D2, no_vectorized = no_vectorized)
-    
+        
     exec_globals = globals().copy()
     exec_globals.update({'np': np, 'nb': nb})
 
-    callmap_func_ast, callmap_name = create_callmap_function_ast(mapping)
-    callmap_func_tree = ast.fix_missing_locations(ast.Module(body=[callmap_func_ast], type_ignores=[])) 
-    # nb_compyled_callmap_func_tree = numba_decorate(callmap_func_tree, )
-
-    original_tree, loop_func_tree, vectorize_func_tree, loop_func_tree_oc, vectorize_func_tree_oc = create_trans
-    formed_function_ast(original_func, callmap_name, mapping, func_int_identifier, D3_to_D2 = D3_to_D2)
-    available_funcs.update(compile_tree(original_tree, exec_globals, func_int_identifier, '_original'))
-    loop_func_tree = encapulate(loop_func_tree, callmap_func_tree, original_tree)
-    available_funcs.update(compile_tree(loop_func_tree, exec_globals, func_int_identifier, '_loop'))
+    prepared_trees = create_transformed_function_ast(original_func, mapping, axis = axis, ndims = ndims, dtype = dtype)
     
-    if not no_vectorized:
-        vectorize_func_tree = encapulate(vectorize_func_tree, callmap_func_tree, original_tree)
-        available_funcs.update(compile_tree(vectorize_func_tree, exec_globals, func_int_identifier, '_vectorized'))
-
-    nb_compyled_loop_func_tree = numba_decorate(loop_func_tree)
-    if not no_vectorized:
-        nb_compyled_vectorize_func_tree = numba_decorate(vectorize_func_tree)
-        available_funcs.update(compile_tree(nb_compyled_vectorize_func_tree, exec_globals, func_int_identifier, '_vectorized_nb_compyled'))
-
-    available_funcs.update(compile_tree(nb_compyled_loop_func_tree, exec_globals, func_int_identifier, '_loop_nb_compyled'))
-
-    nb_compyled_original_tree = numba_decorate(original_tree)
-    nb_compyled_callmap_func_tree = numba_decorate(callmap_func_tree)
-    if not no_vectorized:
-        vectorize_func_tree_oc = encapulate(vectorize_func_tree_oc, nb_compyled_callmap_func_tree, nb_compyled_original_tree)
-        nb_compyled_vectorize_func_oc_tree = numba_decorate(vectorize_func_tree_oc)
-        available_funcs.update(compile_tree(nb_compyled_vectorize_func_oc_tree, exec_globals, func_int_identifier, '_oc_vectorized_nb_compyled'))
-
-    nb_compyled_loop_func_tree_oc = encapulate(loop_func_tree_oc, nb_compyled_callmap_func_tree, nb_compyled_original_tree)
-    nb_compyled_loop_func_tree_oc = numba_decorate(nb_compyled_loop_func_tree_oc)
-    available_funcs.update(compile_tree(nb_compyled_loop_func_tree_oc, exec_globals, func_int_identifier, '_oc_loop_nb_compyled'))
-
+    for tree in prepared_trees:
+        build_qualifier = tree.body[0].name.split('_built__')[-1]
+        if build_qualifier == "uloop_1":
+            build_qualifier="loop"
+        elif build_qualifier == "uloop_opt_1":
+            build_qualifier="uloop_opt"
+        available_funcs.update(compile_tree(tree, exec_globals, original_func.__qualname__, build_qualifier))
+        print(original_func.__qualname__, build_qualifier)
     return available_funcs
 
 
@@ -603,3 +740,4 @@ def _prepare_funcs(original_func: Callable, mapping: Dict[str, int], func_int_id
 #                 res[row, col] = temporary(Z[row,col,:])
 #         return res
 #     return compute
+

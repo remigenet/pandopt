@@ -8,7 +8,7 @@ logger.setLevel(0)
 import pandopt
 from .transfcoders import _prepare_funcs
 
-class DataFrame(pandas.DataFrame):
+class DataFrame(pandas.core.frame.DataFrame):
     """
     A custom DataFrame class that extends pandas.DataFrame with enhanced 
     functionalities for optimized data processing and transformation.
@@ -74,9 +74,10 @@ class DataFrame(pandas.DataFrame):
         >>> custom_df = pandopt.DataFrame(data=data)
         """
 
-        data = kwargs["data"] if "data" in kwargs else args[0]
-        if isinstance(data, np.ndarray) and not data.flags.f_contiguous:
-            data = data.copy(order='F')
+        # data = kwargs["data"] if "data" in kwargs else args[0]
+        # if isinstance(data, np.ndarray) and not data.flags.f_contiguous:
+        #     data = data.copy(order='F')
+        print('INIT GOT', args, kwargs)
         super().__init__(*args, **kwargs)
 
 
@@ -157,7 +158,7 @@ class DataFrame(pandas.DataFrame):
             logger.warning(f'{__class__} {"finish in pandas fallback for func " + str(func) if pandas_fallback else "apply only supports func and axis arguments, using default pandas apply"}')
             return super().apply(func, axis = axis, *args, **kwargs)
         if axis is None:
-            self.apply(func, axis = 0, *args, pandas_fallback = False, data = None, new_index = None, from_rolling = from_rolling, **kwargs).apply(func, axis = 1, *args, pandas_fallback = False, data = None, new_index = None, from_rolling = from_rolling, **kwargs)
+            self.apply(func, axis = 0, *args, pandas_fallback = False, data = None, new_index = None, from_rolling = from_rolling, **kwargs).apply(func, axis = axis, *args, pandas_fallback = False, data = None, new_index = None, from_rolling = from_rolling, **kwargs)
         new_columns = None
         mapping = self.colname_to_colnum if axis == 0 else {True: 0}
         if from_rolling:
@@ -171,13 +172,16 @@ class DataFrame(pandas.DataFrame):
         func_int_identifier = self._compiled_qualifier(
             func_qualifier = func.__qualname__,
             mapper=mapping,
-            D3_to_D2=from_rolling and axis==1,
-            no_vectorized=from_rolling
+            ndims = 2,
+            axis = axis
         )
-        prepared_func = self._build_apply_versions(func, mapping, func_int_identifier, D3_to_D2 = from_rolling and axis == 0, no_vectorized = from_rolling)
+        prepared_func = self._build_apply_versions(func, mapping, func_int_identifier, ndims=2, axis=axis)
+        print(prepared_func)
         test_res = prepared_func(test_set)
         result = prepared_func(data)
-        return pandopt.DataFrame(result, index=new_index, columns=new_columns)
+        if axis is None:
+            return result
+        return __class__(result, index=new_index, columns=new_columns)
 
 
     def _with_fallback_wrap(self, func_int_identifier: str) -> Callable:
@@ -206,12 +210,14 @@ class DataFrame(pandas.DataFrame):
         the custom DataFrame class.
         """
         def _with_protects(*args, **kwargs):
-            for key in ('_oc_vectorized_nb_compyled', '_oc_loop_nb_compyled', '_vectorized_nb_compyled', '_loop_nb_compyled', '_vectorized', '_loop'):
+            for key in ('vectorized_opt', 'loop_opt', 'vectorized', 'loop'):
+                print(key, self.__class__._compiled_func[func_int_identifier])
                 if key not in self.__class__._compiled_func[func_int_identifier]:
                     logger.debug(f'No {key} for {func_int_identifier}')
                     continue
                 try:
                     result = self.__class__._compiled_func[func_int_identifier][key](*args, **kwargs)
+                    print('TA MERE', result, np.shape(result), args, kwargs)
                     if np.shape(result):
                         logger.debug(f"returning {result} with {self.__class__._compiled_func[func_int_identifier][key]}")
                         return result
@@ -221,10 +227,10 @@ class DataFrame(pandas.DataFrame):
                 except Exception as e:
                     logger.warning('Encountered', e)
                     self.__class__._compiled_func[func_int_identifier].pop(key)
-            return self.apply(func = self.__class__._compiled_func['_original'], *args, pandas_fallback = True, **kwargs)
+            return self.apply(func = self.__class__._compiled_func[func_int_identifier]['original'], *args, pandas_fallback = True, **kwargs)
         return _with_protects
 
-    def _compiled_qualifier(self, func_qualifier: str, mapper: Dict[Any, Any], D3_to_D2: bool = False, no_vectorized: bool = False) -> str:
+    def _compiled_qualifier(self, func_qualifier: str, mapper: Dict[Any, Any], ndims: int, axis: int) -> str:
         """
         Generate a unique identifier for a function based on its characteristics.
 
@@ -238,7 +244,6 @@ class DataFrame(pandas.DataFrame):
             The qualifier of the function, typically its name.
         mapper : Dict[Any, Any]
             A mapping used in the function, influencing its behavior.
-        D3_to_D2 : bool, default False
             Flag indicating if the function converts 3D arrays to 2D.
         no_vectorized : bool, default False
             Flag indicating if the function is non-vectorized.
@@ -252,9 +257,9 @@ class DataFrame(pandas.DataFrame):
         -----
         This method is crucial for managing the caching of various compiled versions of functions.
         """
-        return 'fid'+ f'nvct{no_vectorized}' +f'D3_to_D2_{D3_to_D2}' + str(functools.reduce(lambda x, y: x+y, mapper.keys())) + func_qualifier
+        return 'fid'+ f'nvct{func_qualifier}' +f'axis{axis}' + str(functools.reduce(lambda x, y: x+y, mapper.keys())) + func_qualifier
 
-    def _build_apply_versions(self, func: Callable, mapping: Dict[Any, Any], func_int_identifier: str, D3_to_D2: bool = False, no_vectorized: bool = False) -> Callable:
+    def _build_apply_versions(self, func: Callable, mapping: Dict[Any, Any], func_int_identifier: str, ndims:int =2, axis: int = 0) -> Callable:
         """
         Build and cache different apply versions of a given function.
 
@@ -285,7 +290,7 @@ class DataFrame(pandas.DataFrame):
         as it prepares the function in various forms for efficient execution.
         """
         if func_int_identifier not in self.__class__._compiled_func:
-            self.__class__._compiled_func[func_int_identifier] =  _prepare_funcs(func, mapping, str(func_int_identifier), D3_to_D2 = D3_to_D2, no_vectorized = no_vectorized)
+            self.__class__._compiled_func[func_int_identifier] =  _prepare_funcs(func, mapping, str(func_int_identifier), ndims = ndims, axis = axis)
         return self._with_fallback_wrap(func_int_identifier)
 
     def rolling(self, window, *args, **kwargs):
