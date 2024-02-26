@@ -2,11 +2,14 @@ import pandas
 import logging
 import functools
 import numpy as np
+import numba as nb
 from typing import Callable, Type, Dict, Tuple, Any, Union 
 logger = logging.getLogger()
 logger.setLevel(0)
 import pandopt
-from .transfcoders import _prepare_funcs
+from .transfcoders import _prepare_func
+
+import time
 
 class DataFrame(pandas.core.frame.DataFrame):
     """
@@ -50,7 +53,8 @@ class DataFrame(pandas.core.frame.DataFrame):
     >>> custom_df.apply(some_function)
     >>> pandas_df = custom_df.to_pandas()
     """
-    _compiled_func = {}
+    _compiled_env = globals().copy()
+    _compiled_env.update({'np': np, 'nb': nb})
     _outside_call = True
 
     def __init__(self, *args, **kwargs):
@@ -73,11 +77,6 @@ class DataFrame(pandas.core.frame.DataFrame):
         >>> data = np.array([[1, 2], [3, 4]])
         >>> custom_df = pandopt.DataFrame(data=data)
         """
-
-        # data = kwargs["data"] if "data" in kwargs else args[0]
-        # if isinstance(data, np.ndarray) and not data.flags.f_contiguous:
-        #     data = data.copy(order='F')
-        print('INIT GOT', args, kwargs)
         super().__init__(*args, **kwargs)
 
 
@@ -120,7 +119,7 @@ class DataFrame(pandas.core.frame.DataFrame):
         """
         return {k: i for i, k in enumerate(self.index)}
 
-    def apply(self, func, axis = None, *args, pandas_fallback = False, data = None, new_index = None, from_rolling  = False, **kwargs):
+    def apply(self, func, axis = None, *args, data = None, new_index = None, from_rolling  = False, **kwargs):
         """
         Apply a function along an axis of the DataFrame with enhanced capabilities.
 
@@ -154,144 +153,89 @@ class DataFrame(pandas.core.frame.DataFrame):
         >>> custom_df = pandopt.DataFrame(data)
         >>> result_df = custom_df.apply(some_function, axis=1)
         """
-        if pandas_fallback or args or kwargs: 
-            logger.warning(f'{__class__} {"finish in pandas fallback for func " + str(func) if pandas_fallback else "apply only supports func and axis arguments, using default pandas apply"}')
-            return super().apply(func, axis = axis, *args, **kwargs)
-        if axis is None:
-            self.apply(func, axis = 0, *args, pandas_fallback = False, data = None, new_index = None, from_rolling = from_rolling, **kwargs).apply(func, axis = axis, *args, pandas_fallback = False, data = None, new_index = None, from_rolling = from_rolling, **kwargs)
-        new_columns = None
-        mapping = self.colname_to_colnum if axis == 0 else {True: 0}
-        if from_rolling:
-            test_set = data[:min(data.shape[0] - 1, 10+ len(self.index) - len(new_index)),:,:]
-            new_columns = self.columns if axis == 0 else None
-        else:
-            data =  (self.to_numpy() if axis else self.to_numpy().T)
-            test_set = data[:min(data.shape[0] - 1, 10)]
-            new_index = self.index if axis == 1 else self.columns
-
-        func_int_identifier = self._compiled_qualifier(
-            func_qualifier = func.__qualname__,
-            mapper=mapping,
-            ndims = 2,
-            axis = axis
-        )
-        prepared_func = self._build_apply_versions(func, mapping, func_int_identifier, ndims=2, axis=axis)
-        print(prepared_func)
-        test_res = prepared_func(test_set)
-        result = prepared_func(data)
-        if axis is None:
+        if len((dtypes:=set(self.dtypes)))>1:
+            return super().apply(func, axis, **kwargs)
+        dtype = str(dtypes.pop())
+        prepared = _prepare_func(func, self.columns if axis==1 else self.index, axis = axis or 0, ndims = 2, dtype = dtype, globals = __class__._compiled_env)
+        if "vectorized" in prepared:
+            try:
+                result = prepared['vectorized']['function'](self.to_numpy())
+                result = __class__(result, index = self.columns if axis==0 else self.index)
+                return result
+            except Exception as e:
+                print(e)
+        try:
+            result = prepared['modified']['function'](self.to_numpy())
+            result = __class__(result, index = self.columns if axis==0 else self.index)
             return result
-        return __class__(result, index=new_index, columns=new_columns)
+        except Exception as e:
+            print(e)
+        
+        return super().apply(func, axis, **kwargs)
 
 
-    def _with_fallback_wrap(self, func_int_identifier: str) -> Callable:
-        """
-        Wrap the function call with a fallback mechanism.
+    # def _compiled_qualifier(self, func_qualifier: str, mapper: Dict[Any, Any], ndims: int, axis: int) -> str:
+    #     """
+    #     Generate a unique identifier for a function based on its characteristics.
 
-        This internal method is used to wrap the execution of a function with
-        various compiled versions for optimization. If an optimized version fails,
-        it falls back to the next available version or ultimately to the standard
-        pandas apply method.
+    #     This internal method is used to create a unique string identifier for a function,
+    #     which includes its name and other attributes like whether it's vectorized or
+    #     designed for 3D to 2D conversion.
 
-        Parameters
-        ----------
-        func_int_identifier : str
-            The identifier of the function for which to retrieve compiled versions.
+    #     Parameters
+    #     ----------
+    #     func_qualifier : str
+    #         The qualifier of the function, typically its name.
+    #     mapper : Dict[Any, Any]
+    #         A mapping used in the function, influencing its behavior.
+    #         Flag indicating if the function converts 3D arrays to 2D.
+    #     no_vectorized : bool, default False
+    #         Flag indicating if the function is non-vectorized.
 
-        Returns
-        -------
-        Callable
-            A wrapped function that tries various compiled versions and falls back 
-            to standard pandas apply if necessary.
+    #     Returns
+    #     -------
+    #     str
+    #         A unique string identifier for the function.
 
-        Notes
-        -----
-        This method is used internally for optimized function application in 
-        the custom DataFrame class.
-        """
-        def _with_protects(*args, **kwargs):
-            for key in ('vectorized_opt', 'loop_opt', 'vectorized', 'loop'):
-                print(key, self.__class__._compiled_func[func_int_identifier])
-                if key not in self.__class__._compiled_func[func_int_identifier]:
-                    logger.debug(f'No {key} for {func_int_identifier}')
-                    continue
-                try:
-                    result = self.__class__._compiled_func[func_int_identifier][key](*args, **kwargs)
-                    print('TA MERE', result, np.shape(result), args, kwargs)
-                    if np.shape(result):
-                        logger.debug(f"returning {result} with {self.__class__._compiled_func[func_int_identifier][key]}")
-                        return result
-                    else:
-                        logger.debug(f'Encountered {key} with not untented result {np.shape(result)} -> {result}')
-                        self.__class__._compiled_func[func_int_identifier].pop(key)
-                except Exception as e:
-                    logger.warning('Encountered', e)
-                    self.__class__._compiled_func[func_int_identifier].pop(key)
-            return self.apply(func = self.__class__._compiled_func[func_int_identifier]['original'], *args, pandas_fallback = True, **kwargs)
-        return _with_protects
+    #     Notes
+    #     -----
+    #     This method is crucial for managing the caching of various compiled versions of functions.
+    #     """
+    #     return 'fid'+ f'nvct{func_qualifier}' +f'axis{axis}' + str(functools.reduce(lambda x, y: x+y, mapper.keys())) + func_qualifier
 
-    def _compiled_qualifier(self, func_qualifier: str, mapper: Dict[Any, Any], ndims: int, axis: int) -> str:
-        """
-        Generate a unique identifier for a function based on its characteristics.
+    # def _build_apply_versions(self, func: Callable, mapping: Dict[Any, Any], func_int_identifier: str, ndims:int =2, axis: int = 0) -> Callable:
+    #     """
+    #     Build and cache different apply versions of a given function.
 
-        This internal method is used to create a unique string identifier for a function,
-        which includes its name and other attributes like whether it's vectorized or
-        designed for 3D to 2D conversion.
+    #     This internal method compiles and caches various versions of a function for
+    #     optimized execution, including vectorized and non-vectorized versions.
 
-        Parameters
-        ----------
-        func_qualifier : str
-            The qualifier of the function, typically its name.
-        mapper : Dict[Any, Any]
-            A mapping used in the function, influencing its behavior.
-            Flag indicating if the function converts 3D arrays to 2D.
-        no_vectorized : bool, default False
-            Flag indicating if the function is non-vectorized.
+    #     Parameters
+    #     ----------
+    #     func : Callables
+    #         The function to be compiled in different versions.
+    #     mapping : Dict[Any, Any]
+    #         A mapping dict influencing the behavior of the function.
+    #     func_int_identifier : str
+    #         The unique identifier for the function.
+    #     D3_to_D2 : bool, default False
+    #         Indicates if the function is used for 3D to 2D array conversion.
+    #     no_vectorized : bool, default False
+    #         Indicates if the function should not have a vectorized version.
 
-        Returns
-        -------
-        str
-            A unique string identifier for the function.
+    #     Returns
+    #     -------
+    #     Callable
+    #         The wrapped function with fallback mechanism.
 
-        Notes
-        -----
-        This method is crucial for managing the caching of various compiled versions of functions.
-        """
-        return 'fid'+ f'nvct{func_qualifier}' +f'axis{axis}' + str(functools.reduce(lambda x, y: x+y, mapper.keys())) + func_qualifier
-
-    def _build_apply_versions(self, func: Callable, mapping: Dict[Any, Any], func_int_identifier: str, ndims:int =2, axis: int = 0) -> Callable:
-        """
-        Build and cache different apply versions of a given function.
-
-        This internal method compiles and caches various versions of a function for
-        optimized execution, including vectorized and non-vectorized versions.
-
-        Parameters
-        ----------
-        func : Callables
-            The function to be compiled in different versions.
-        mapping : Dict[Any, Any]
-            A mapping dict influencing the behavior of the function.
-        func_int_identifier : str
-            The unique identifier for the function.
-        D3_to_D2 : bool, default False
-            Indicates if the function is used for 3D to 2D array conversion.
-        no_vectorized : bool, default False
-            Indicates if the function should not have a vectorized version.
-
-        Returns
-        -------
-        Callable
-            The wrapped function with fallback mechanism.
-
-        Notes
-        -----
-        This method is central to the optimization capabilities of the custom DataFrame class, 
-        as it prepares the function in various forms for efficient execution.
-        """
-        if func_int_identifier not in self.__class__._compiled_func:
-            self.__class__._compiled_func[func_int_identifier] =  _prepare_funcs(func, mapping, str(func_int_identifier), ndims = ndims, axis = axis)
-        return self._with_fallback_wrap(func_int_identifier)
+    #     Notes
+    #     -----
+    #     This method is central to the optimization capabilities of the custom DataFrame class, 
+    #     as it prepares the function in various forms for efficient execution.
+    #     """
+    #     if func_int_identifier not in self.__class__._compiled_func:
+    #         self.__class__._compiled_func[func_int_identifier] =  _prepare_funcs(func, mapping, str(func_int_identifier), ndims = ndims, axis = axis)
+    #     return self._with_fallback_wrap(func_int_identifier)
 
     def rolling(self, window, *args, **kwargs):
         """

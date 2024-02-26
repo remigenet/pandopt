@@ -1,0 +1,16 @@
+{
+	"folders": [
+		{
+			"path": "../../PhD"
+		},
+		{
+			"path": "../../Introduction-Python"
+		},
+		{
+			"path": ".."
+		}
+	],
+	"settings": {
+		"DockerRun.DisableDockerrc": true
+	}
+}
