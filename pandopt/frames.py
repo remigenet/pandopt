@@ -119,7 +119,14 @@ class DataFrame(pandas.core.frame.DataFrame):
         """
         return {k: i for i, k in enumerate(self.index)}
 
-    def apply(self, func, axis = None, *args, data = None, new_index = None, from_rolling  = False, **kwargs):
+    # def agg(self, *args, **kwargs):
+    #     return self.aggregate(*args, **kwargs)
+
+    # def apply(self, *args, **kwargs):
+
+    
+
+    def apply(self, funcs, axis = None, *args, **kwargs):
         """
         Apply a function along an axis of the DataFrame with enhanced capabilities.
 
@@ -154,88 +161,20 @@ class DataFrame(pandas.core.frame.DataFrame):
         >>> result_df = custom_df.apply(some_function, axis=1)
         """
         if len((dtypes:=set(self.dtypes)))>1:
-            return super().apply(func, axis, **kwargs)
+            return super().apply(funcs, axis, **kwargs)
+        if isinstance(funcs, Callable):
+            funcs = [funcs]
         dtype = str(dtypes.pop())
-        prepared = _prepare_func(func, self.columns if axis==1 else self.index, axis = axis or 0, ndims = 2, dtype = dtype, globals = __class__._compiled_env)
-        if "vectorized" in prepared:
-            try:
-                result = prepared['vectorized']['function'](self.to_numpy())
-                result = __class__(result, index = self.columns if axis==0 else self.index)
-                return result
-            except Exception as e:
-                print(e)
+        prepared = _prepare_func(funcs, self.columns if axis==1 else self.index, axis = axis or 0, ndims = 2, dtype = dtype, globals=self.__class__._compiled_env)
         try:
-            result = prepared['modified']['function'](self.to_numpy())
-            result = __class__(result, index = self.columns if axis==0 else self.index)
+            result = prepared['function'](self.to_numpy())
+            result = __class__(result, index = self.columns if axis==0 else self.index, columns=[func.__name__ for func in funcs])
             return result
         except Exception as e:
             print(e)
         
-        return super().apply(func, axis, **kwargs)
+        return super().apply(funcs, axis, **kwargs)
 
-
-    # def _compiled_qualifier(self, func_qualifier: str, mapper: Dict[Any, Any], ndims: int, axis: int) -> str:
-    #     """
-    #     Generate a unique identifier for a function based on its characteristics.
-
-    #     This internal method is used to create a unique string identifier for a function,
-    #     which includes its name and other attributes like whether it's vectorized or
-    #     designed for 3D to 2D conversion.
-
-    #     Parameters
-    #     ----------
-    #     func_qualifier : str
-    #         The qualifier of the function, typically its name.
-    #     mapper : Dict[Any, Any]
-    #         A mapping used in the function, influencing its behavior.
-    #         Flag indicating if the function converts 3D arrays to 2D.
-    #     no_vectorized : bool, default False
-    #         Flag indicating if the function is non-vectorized.
-
-    #     Returns
-    #     -------
-    #     str
-    #         A unique string identifier for the function.
-
-    #     Notes
-    #     -----
-    #     This method is crucial for managing the caching of various compiled versions of functions.
-    #     """
-    #     return 'fid'+ f'nvct{func_qualifier}' +f'axis{axis}' + str(functools.reduce(lambda x, y: x+y, mapper.keys())) + func_qualifier
-
-    # def _build_apply_versions(self, func: Callable, mapping: Dict[Any, Any], func_int_identifier: str, ndims:int =2, axis: int = 0) -> Callable:
-    #     """
-    #     Build and cache different apply versions of a given function.
-
-    #     This internal method compiles and caches various versions of a function for
-    #     optimized execution, including vectorized and non-vectorized versions.
-
-    #     Parameters
-    #     ----------
-    #     func : Callables
-    #         The function to be compiled in different versions.
-    #     mapping : Dict[Any, Any]
-    #         A mapping dict influencing the behavior of the function.
-    #     func_int_identifier : str
-    #         The unique identifier for the function.
-    #     D3_to_D2 : bool, default False
-    #         Indicates if the function is used for 3D to 2D array conversion.
-    #     no_vectorized : bool, default False
-    #         Indicates if the function should not have a vectorized version.
-
-    #     Returns
-    #     -------
-    #     Callable
-    #         The wrapped function with fallback mechanism.
-
-    #     Notes
-    #     -----
-    #     This method is central to the optimization capabilities of the custom DataFrame class, 
-    #     as it prepares the function in various forms for efficient execution.
-    #     """
-    #     if func_int_identifier not in self.__class__._compiled_func:
-    #         self.__class__._compiled_func[func_int_identifier] =  _prepare_funcs(func, mapping, str(func_int_identifier), ndims = ndims, axis = axis)
-    #     return self._with_fallback_wrap(func_int_identifier)
 
     def rolling(self, window, *args, **kwargs):
         """
@@ -261,52 +200,41 @@ class DataFrame(pandas.core.frame.DataFrame):
         """
         return pandopt.RollOpt(self, window=window, *args, **kwargs)
 
-    
-    # def groupby(self, *args, **kwargs):
-    #     return pandopt.GroupOpt(self, *args, **kwargs)
-
-    # def resample(self, *args, **kwargs):
-    #     # NotImplementedError('Expanding not yet implemented')
-    #     return super().resample(*args, **kwargs)
-
-    # def expanding(self, *args, **kwargs):
-    #     # NotImplementedError('Expanding not yet implemented')
-    #     return super().expanding(*args, **kwargs)
 
 
-    def __getattr__(self, name):
-        """
-        Custom method to handle dynamic attribute access.
+    # def __getattr__(self, name):
+    #     """
+    #     Custom method to handle dynamic attribute access.
 
-        This method is called if the requested attribute is not found in the usual places 
-        (i.e., it is not an instance attribute nor is it found in the class tree for self).
+    #     This method is called if the requested attribute is not found in the usual places 
+    #     (i.e., it is not an instance attribute nor is it found in the class tree for self).
 
-        Parameters
-        ----------
-        name : str
-            The name of the attribute being accessed.
+    #     Parameters
+    #     ----------
+    #     name : str
+    #         The name of the attribute being accessed.
 
-        Returns
-        -------
-        Callable
-            A function wrapper that when called will apply the dynamically loaded function.
+    #     Returns
+    #     -------
+    #     Callable
+    #         A function wrapper that when called will apply the dynamically loaded function.
 
-        Raises
-        ------
-        AttributeError
-            If the function name is not found or could not be loaded.
+    #     Raises
+    #     ------
+    #     AttributeError
+    #         If the function name is not found or could not be loaded.
 
-        Examples
-        --------
-        >>> import pandopt
-        >>> custom_df = pandopt.DataFrame(data)
-        >>> result = custom_df.some_custom_function()
-        """
-        def wrapper(*args, **kwargs):
-            try:
-                func = pandopt.load_function(name)
-            except AttributeError:
-                raise AttributeError(f"{name} not found or could not be loaded.")
-            return self.apply(func=func, *args, **kwargs)
-        return wrapper
+    #     Examples
+    #     --------
+    #     >>> import pandopt
+    #     >>> custom_df = pandopt.DataFrame(data)
+    #     >>> result = custom_df.some_custom_function()
+    #     """
+    #     def wrapper(*args, **kwargs):
+    #         try:
+    #             func = pandopt.load_function(name)
+    #         except AttributeError:
+    #             raise AttributeError(f"{name} not found or could not be loaded.")
+    #         return self.apply(func=func, *args, **kwargs)
+    #     return wrapper
 

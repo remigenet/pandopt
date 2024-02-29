@@ -4,43 +4,38 @@ import inspect
 import logging
 import functools
 import sys
-from typing import Callable, Type, Dict, Tuple, Any, Union, Iterable, List
+from typing import Callable, Type, Dict, Tuple, Any, Union, Iterable, List, Optional
 import numpy as np
 from functools import reduce
 import numba as nb
 import hashlib
-import tempfile
-fp = tempfile.NamedTemporaryFile()
+
 
 def source_parser(f):
     source = inspect.getsource(f)
-    if any(source.startswith(managed_method) for managed_method in ['apply', 'aggregate', 'source_parser']):
-        code = "def lamndaX(x):\n"
-        code += "    return " + source[source.find('x:') + 2:source.find('mapping')].strip().strip(',').strip(':').strip(')'), 'lamndaX'
+    if any(source.startswith(managed_method) for managed_method in ["apply", "aggregate", "source_parser"]):
+        code = "    return " + source[source.find('x:') + 2:source.find('mapping')].strip().strip(',').strip(':').strip(')')
     elif f.__module__ != '__main__':
-        code = "def "+ f.__module__ + '_' + f.__qualname__ + "(x):\n"
-        code += "    return " + f.__module__ + '.' + f.__qualname__ +'(x)\n'
-        code += "import " + f.__module__ + '\n'
-        return  code, f.__module__ + '_' + f.__qualname__
+        code = "    import " + f.__module__ + '\n'
+        code += "    return " + f.__module__ + '.' + f.__qualname__ +'(x)'
     else:
-        return source, f.__name__
-    return 
+        return source
+    uid = int(hashlib.sha1(code.encode("utf-8")).hexdigest(), 16) % (10 ** 8)
+    return (f"""
+def f{uid}(x):
+{code} 
+    """)
     
 
-def create_callmap_function_ast(index: Iterable[str], fuid: str) -> ast.FunctionDef:
+def create_if_callmap_function_ast(index: Iterable[str], fuid: str) -> ast.FunctionDef:
 
 
     body = []
     for value, key in enumerate(index):
-        try:
-            key = int(key)
-            continue
-        except ValueError:
-            key = ast.Constant(value=key)
         compare = ast.Compare(
             left=ast.Name(id='x', ctx=ast.Load()),
             ops=[ast.Eq()],
-            comparators=[key]
+            comparators=[ast.Constant(value = key)]
         )
         body.append(
             ast.If(
@@ -53,30 +48,9 @@ def create_callmap_function_ast(index: Iterable[str], fuid: str) -> ast.Function
     # Add a default return statement
     body.append(ast.Return(value=ast.Constant(value=value+1)))
 
-    # Create the Numba JIT decorator with specified options
-    numba_decorator = ast.Call(
-        func=ast.Attribute(value=ast.Name(id='nb', ctx=ast.Load()), attr='njit', ctx=ast.Load()),
-        args=[
-            ast.Call(
-                func=ast.Attribute(value=ast.Name(id='nb', ctx=ast.Load()), attr='int8', ctx=ast.Load()),
-                args=[ast.Attribute(value=ast.Name(id='nb', ctx=ast.Load()), attr='types.string', ctx=ast.Load())],
-                keywords=[]
-            )
-        ],
-        keywords=[
-            ast.keyword(arg='cache', value=ast.Constant(value=True)),
-            ast.keyword(arg='fastmath', value=ast.Constant(value=True)),
-            ast.keyword(arg='looplift', value=ast.Constant(value=True)),
-            ast.keyword(arg='inline', value=ast.Constant(value='always')),
-            ast.keyword(arg='target_backend', value=ast.Constant(value='host')),
-            ast.keyword(arg='no_rewrites', value=ast.Constant(value=True)),
-            ast.keyword(arg='nogil', value=ast.Constant(value=True)),
-        ]
-    )
-    
     # Create the function definition
     func_def = ast.FunctionDef(
-        name=(callmap_name:=f'callmap{fuid}'),
+        name=(callmap_name:=f'if_callmap_{hashlib.sha1(fuid.encode("utf-8")).hexdigest()}'),
         args=ast.arguments(
             posonlyargs=[],
             args=[ast.arg(arg='x')],
@@ -87,11 +61,62 @@ def create_callmap_function_ast(index: Iterable[str], fuid: str) -> ast.Function
             defaults=[]
         ),
         body=body,
-        decorator_list=[numba_decorator],
+        decorator_list=[],
         returns=None
     )
-    return func_def, callmap_name
+    
+    callmap_str = ast.unparse(ast.fix_missing_locations(ast.Module(body=[func_def], type_ignores=[])))
 
+    decorator = "@nb.njit(nb.uint8(nb.types.string), cache=True, looplift=True, inline='always', target_backend='host', no_cfunc_wrapper=True, no_rewrites=True, nogil=True)\n"
+    
+    return decorator + callmap_str, callmap_name
+
+def create_func_callmap_function_ast(funcs_list: Iterable[str]) -> ast.FunctionDef:
+
+    
+    body = []
+    for idx, func in enumerate(funcs_list):
+        compare = ast.Compare(
+            left=ast.Name(id='idx', ctx=ast.Load()),
+            ops=[ast.Eq()],
+            comparators=[ast.Constant(value=idx)]
+        )
+        body.append(
+            ast.If(
+                test=compare,
+                body=[ast.Return(value=ast.Call(func=ast.Name(id=func, ctx=ast.Load()),
+                                               args=[ast.Name(id='x', ctx=ast.Load())], 
+                                               keywords=[]))],
+                orelse=[]
+            )
+        )
+    # Add a default return statement
+    body.append(ast.Return(value=ast.Call(func=ast.Name(id=func, ctx=ast.Load()),
+                                               args=[ast.Name(id='x', ctx=ast.Load())], 
+                                               keywords=[])))
+
+
+    # Create the function definition
+    func_def = ast.FunctionDef(
+        name=(callmap_name:=f'func_callmap_{hashlib.sha1("".join((func for func in funcs_list)).encode("utf-8")).hexdigest()}'),
+        args=ast.arguments(
+            posonlyargs=[],
+            args=[ast.arg(arg='idx'), ast.arg(arg='x')],
+            vararg=None,
+            kwonlyargs=[],
+            kw_defaults=[],
+            kwarg=None,
+            defaults=[]
+        ),
+        body=body,
+        decorator_list=[],
+        returns=None
+    )
+    decorator = "@nb.njit(nb.PLACEHOLDERDTYPE(nb.uint8, nb.PLACEHOLDERDTYPE[:]), cache=True, parallel=True, fastmath=True, forceinline=True, looplift=True, inline='always', target_backend='host', no_cfunc_wrapper=True, no_rewrites=True, nogil=True)\n"
+    
+    callmap_str = ast.unparse(ast.fix_missing_locations(ast.Module(body=[func_def], type_ignores=[])))
+
+    return decorator + callmap_str, callmap_name
 
 class SubscriptReplacer(ast.NodeTransformer):
     """
@@ -116,7 +141,7 @@ class SubscriptReplacer(ast.NodeTransformer):
     >>> modified_tree = replacer.visit(original_tree)
     """
     
-    def __init__(self, arg_name: str, new_var_name: str, index: List[str], for_vectorize_form: bool, axis: int, ndims : int):
+    def __init__(self, arg_name: str, new_var_name: str, index: List[str], for_vectorize_form: bool, axis: int, ndims : int, callmap_name: Optional[str] = None, callmap_def: Optional[str] = None):
         """
         Initialize the SubscriptReplacer with the specified argument name.
 
@@ -132,8 +157,8 @@ class SubscriptReplacer(ast.NodeTransformer):
 
         self.arg_name = arg_name
         self.new_var_name = new_var_name
-        self.callmap_name = None
-        self.callmap_def = None
+        self.callmap_name = callmap_name
+        self.callmap_def = callmap_def
         self.index = index
         self.for_vectorize_form = for_vectorize_form
         self.axis = axis
@@ -147,8 +172,7 @@ class SubscriptReplacer(ast.NodeTransformer):
         if isinstance(node.value, ast.Name) and node.value.id == self.arg_name:
             # Check for Python version compatibility
             if self.fuid == '_general_':
-                self.index = self.index.astype(str)
-                self.fuid = hashlib.sha1("".join(self.index).encode("UTF-8")).digest().hex()
+                self.fuid = hashlib.sha1("".join(self.index.astype(str)).encode("UTF-8")).digest().hex()
             if sys.version_info >= (3, 9):
                 # Python 3.9 and later
                 old_slice = node.slice
@@ -159,7 +183,7 @@ class SubscriptReplacer(ast.NodeTransformer):
                 new_value = ast.Constant(value = idxs[0])
             else:
                 if self.callmap_name is None:
-                    self.callmap_def, self.callmap_name = create_callmap_function_ast(self.index, self.fuid)
+                    self.callmap_def, self.callmap_name = create_if_callmap_function_ast(self.index, self.fuid)
                 new_value = ast.Call(
                         func=ast.Name(id=self.callmap_name, ctx=ast.Load()),
                         args=[old_slice],
@@ -201,120 +225,168 @@ class SubscriptReplacer(ast.NodeTransformer):
             node.id = self.new_var_name
         return self.generic_visit(node) 
 
-def AstModifier(original_func, index, axis, ndims):
-    modified_tree, vectorize_tree = None, None
-    source_code, original_name = source_parser(original_func)
-    original_tree = ast.parse(source_code)
+def AstModifier(original_funcs, index, axis, ndims):
 
-    arg_name = original_tree.body[0].args.args[0].arg
-    new_name = arg_name + "X"
-    while new_name in source_code:
-        new_name + "X"
-        
-    replacer = SubscriptReplacer(arg_name, new_name, index, for_vectorize_form=False, axis = axis, ndims = ndims)
-    modified_tree = copy.deepcopy(original_tree)
-    modified_tree = replacer.visit(modified_tree)
-    ast.fix_missing_locations(modified_tree)
-    fuid = original_name + replacer.fuid 
-    modified_tree.body[0].args.args[0].arg = new_name
-    modified_tree.body[0].name += fuid +"_modified" 
-    ast.fix_missing_locations(modified_tree)
-
-    if replacer.vectorizable:
-        replacer = SubscriptReplacer(arg_name, new_name, index, for_vectorize_form=True, axis = axis, ndims = ndims)
-        vectorize_tree = copy.deepcopy(original_tree)
-        vectorize_tree = replacer.visit(vectorize_tree)
-        ast.fix_missing_locations(vectorize_tree)
-        vectorize_tree.body[0].args.args[0].arg = new_name
-        vectorize_tree.body[0].name += fuid +"_vectorized"
-        ast.fix_missing_locations(vectorize_tree)
+    callmap_name, callmap_def = None, None
+    modified_funcs, modified_names = [], []
+    for original_func in original_funcs:
+        modified_tree, vectorize_tree = None, None
+        source_code = source_parser(original_func)
+        original_tree = ast.parse(source_code)
     
-    original_tree.body[0].name += fuid +"_original" 
-    return fuid, original_name, ast.unparse(original_tree), ast.unparse(modified_tree), ast.unparse(vectorize_tree) if vectorize_tree is not None else None, ast.unparse(ast.fix_missing_locations(ast.Module(body=[replacer.callmap_def], type_ignores=[]))) if replacer.callmap_def is not None else ""
+        arg_name = original_tree.body[0].args.args[0].arg
+        new_name = arg_name + "X"
+        while new_name in source_code:
+            new_name + "X"
+            
+        replacer = SubscriptReplacer(arg_name, new_name, index, for_vectorize_form=False, axis = axis, ndims = ndims, callmap_name = callmap_name, callmap_def = callmap_def)
+        
+        modified_tree = copy.deepcopy(original_tree)
+        modified_tree = replacer.visit(modified_tree)
+        callmap_name, callmap_def = replacer.callmap_name, replacer.callmap_def
+        ast.fix_missing_locations(modified_tree)
+        fuid = original_func.__name__ + replacer.fuid  + str(axis)
+        modified_tree.body[0].args.args[0].arg = new_name
+        modified_tree.body[0].name = f'f{hashlib.sha1((fuid).encode("utf-8")).hexdigest()}'
+        ast.fix_missing_locations(modified_tree)
+        modified_funcs.append(ast.unparse(modified_tree) + "\n\n" )
+        modified_names.append(modified_tree.body[0].name)
 
-two_dim_axis_0 = """
-PLACEHOLDERCALLMAP
+    final_func_callmap, final_func_callmap_name = create_func_callmap_function_ast(modified_names)
 
-@nb.njit(nb.PLACEHOLDERDTYPE(nb.PLACEHOLDERDTYPE[:]), cache=True, fastmath=True, forceinline=True, looplift=True, inline='always', target_backend='host', nogil=True)
+    decorator = "@nb.njit(nb.PLACEHOLDERDTYPE(nb.PLACEHOLDERDTYPE[:]), cache=True, fastmath=True, forceinline=True, looplift=True, inline='always', target_backend='host', no_cfunc_wrapper=True, no_rewrites=True, nogil=True)\n"
+
+    final_text = decorator + decorator.join(modified_funcs) + "\n"
+    final_text += final_func_callmap
+    if callmap_def is not None:
+        final_text = callmap_def + "\n\n" + final_text
+    
+    return final_func_callmap_name, final_text
+
+
+two_dim = """
 PLACEHOLDERFUNC
 
-@nb.njit((nb.PLACEHOLDERDTYPE[:], nb.PLACEHOLDERDTYPE[:],nb.types.uint32), cache=True, fastmath=True, forceinline=True, looplift=True, inline='always', target_backend='host', nogil=True)
-def vl_PLACEHOLDERUID(z, r, i):
-    r[i] = PLACEHOLDERNAME(z)
-
-@nb.njit((nb.PLACEHOLDERDTYPE[:,:], nb.PLACEHOLDERDTYPE[:],nb.types.uint32), cache=True, parallel=True, fastmath=True, forceinline=True, looplift=True, inline='always', target_backend='host', no_cfunc_wrapper=True, no_rewrites=True, nogil=True)
-def cvlopt_PLACEHOLDERUID(z, r, n):
+@nb.njit((nb.PLACEHOLDERDTYPE[:,:], nb.PLACEHOLDERDTYPE[:, :],nb.types.uint32), cache=True, parallel=True, fastmath=True, forceinline=True, looplift=True, inline='always', target_backend='host', no_cfunc_wrapper=True, no_rewrites=True, nogil=True)
+def cvlopt_PLACEHOLDERNAME(z, r, n):
     for i in nb.prange(n):
-        vl_PLACEHOLDERUID(z[:,i], r, i)
+        for j in nb.prange(PLACEHOLDERNFUNC):
+            r[i, j] = PLACEHOLDERNAME(j, zPLACEHOLDERAXISSELECT)
 
-def vlopt_PLACEHOLDERUID(z):
-    n = np.uint32(z.shape[1])  # Determine the number of rows in z
-    r = np.empty(n, dtype=np.PLACEHOLDERDTYPE)  # Initialize the result array
-    cvlopt_PLACEHOLDERUID(z, r, n)
+def vlopt_PLACEHOLDERNAME(z):
+    n = np.uint32(z.shape[PLACEHOLDERAXIS])  # Determine the number of rows in z
+    r = np.empty((n, PLACEHOLDERNFUNC), dtype=np.PLACEHOLDERDTYPE)  # Initialize the result array
+    cvlopt_PLACEHOLDERNAME(z, r, n)
     return r
 """
 
-two_dim_axis_1 = """
-PLACEHOLDERCALLMAP
-
-@nb.njit(nb.PLACEHOLDERDTYPE(nb.PLACEHOLDERDTYPE[:]), cache=True, fastmath=False, forceinline=True, looplift=True, inline='always', target_backend='host', nogil=True)
+three_dim_axis_0 = """
 PLACEHOLDERFUNC
 
-@nb.njit((nb.PLACEHOLDERDTYPE[:], nb.PLACEHOLDERDTYPE[:],nb.types.uint32), cache=True, fastmath=True, forceinline=True, looplift=True, inline='always', target_backend='host', nogil=True)
-def vl_PLACEHOLDERUID(z, r, i):
-    r[i] = PLACEHOLDERNAME(z)
-
-@nb.njit((nb.PLACEHOLDERDTYPE[:,:], nb.PLACEHOLDERDTYPE[:],nb.types.uint32), cache=True, parallel=True, fastmath=True, forceinline=True, looplift=True, inline='always', target_backend='host', no_cfunc_wrapper=True, no_rewrites=True, nogil=True)
-def cvlopt_PLACEHOLDERUID(z, r, n):
+@nb.njit((nb.PLACEHOLDERDTYPE[:,:,:], nb.PLACEHOLDERDTYPE[:, :],nb.types.uint32, nb.types.uint32), cache=True, parallel=True, fastmath=True, forceinline=True, looplift=True, inline='always', target_backend='host', no_cfunc_wrapper=True, no_rewrites=True, nogil=True)
+def cvlopt_PLACEHOLDERNAME(z, r, n, m):
     for i in nb.prange(n):
-        vl_PLACEHOLDERUID(z[i,:], r, i)
+        for j in nb.prange(PLACEHOLDERNFUNC):
+            for k in nb.prange(m):
+                r[i, j * k + j] = PLACEHOLDERNAME(j, z[i, k, :])
 
-def vlopt_PLACEHOLDERUID(z):
+def vlopt_PLACEHOLDERNAME(z):
     n = np.uint32(z.shape[0])  # Determine the number of rows in z
-    r = np.empty(n, dtype=np.PLACEHOLDERDTYPE)  # Initialize the result array
-    cvlopt_PLACEHOLDERUID(z, r, n)
+    m = np.uint32(z.shape[1])  # Determine the number of rows in z
+    r = np.empty((n, PLACEHOLDERNFUNC * m), dtype=np.PLACEHOLDERDTYPE)  # Initialize the result array
+    cvlopt_PLACEHOLDERNAME(z, r, n, m)
     return r
 """
 
-def _make_func(base_model: str, name: str, func: str, dtype: str, uid: str, callmap: str):
+three_dim_axis_1 = """
+PLACEHOLDERFUNC
+
+@nb.njit((nb.PLACEHOLDERDTYPE[:,:,:], nb.PLACEHOLDERDTYPE[:, :],nb.types.uint32), cache=True, parallel=True, fastmath=True, forceinline=True, looplift=True, inline='always', target_backend='host', no_cfunc_wrapper=True, no_rewrites=True, nogil=True)
+def cvlopt_PLACEHOLDERNAME(z, r, n):
+    for i in nb.prange(n):
+        for j in nb.prange(PLACEHOLDERNFUNC):
+            r[i, j] = PLACEHOLDERNAME(j, z[i,:,:])
+
+def vlopt_PLACEHOLDERNAME(arr, window):
+    n = np.uint32(z.shape[0])  # Determine the number of rows in z
+    r = np.empty((n - window + 1, PLACEHOLDERNFUNC), dtype=np.PLACEHOLDERDTYPE)  # Initialize the result array
+    cvlopt_PLACEHOLDERNAME(sliding_window_view(arr, window, axis=0), r, n)
+    return r
+"""
+
+def _make_func(base_model: str, name: str, func: str, dtype: str, axis: str, axis_select: str, n_funcs: int):
     final = base_model.replace('PLACEHOLDERNAME', name)
     final = final.replace('PLACEHOLDERFUNC', func)
     final = final.replace('PLACEHOLDERDTYPE', dtype)
-    final = final.replace('PLACEHOLDERUID', uid)
-    final = final.replace('PLACEHOLDERCALLMAP', callmap)
+    final = final.replace('PLACEHOLDERAXISSELECT', axis_select)
+    final = final.replace('PLACEHOLDERAXIS', axis)
+    final = final.replace('PLACEHOLDERNFUNC', str(n_funcs))
     return final
     
 
-def _compile_tree(func: Dict[str, str], globals: Dict[str, Any]) -> Dict:
+def _compile_tree(func: Dict[str, str], exec_globals: Dict[str, Any]) -> Dict:
     def wrapped(x):
-        if func['name'] not in globals:
-            exec(compile(ast.parse(func['source_code']), filename=fp.name, mode="exec"), globals)
-        return globals[func['name']](x)
+        if func['name'] not in exec_globals:
+            exec(compile(ast.parse(func['source_code']), filename="/tmp/numbacache", mode="exec"), exec_globals)
+        return exec_globals[func['name']](x)
     wrapped.__name__ = func['name']
     wrapped.__qualname__ = "__numba__." + func['name']
     return wrapped
 
-def _prepare_func(original_func: Callable, index: Iterable[str], axis: int, ndims: int, dtype: str, globals: Dict[str, Any]) -> Tuple[ast.AST, ast.AST, ast.AST]:
-    result = {}
-    fuid, original_name, original, modified, vectorized, callmap = AstModifier(original_func = original_func, index = index, axis = axis, ndims = ndims)
-    name_with_id = original_func.__name__ + fuid
-    result['original'] = {"name":  name_with_id + "_original", "source_code": original}
-    result["original"]["function"] = _compile_tree(result["original"], globals)
-    if ndims == 1:
-        decorator =  "@nb.njit(nb.{dtype}(nb.{dtype}[:]), cache = False, fastmath=True, forceinline=True, looplift=True, inline='always', target_backend='host', no_cfunc_wrapper=True, no_rewrites=True, nogil=True)\n"
-        result['modified'] = decorator + modified
-        return result
-    elif ndims == 2:
-        final_name =  "vlopt_" + fuid 
-        modified_name = name_with_id + "_modified"
+def _prepare_func(original_funcs: Callable, index: Iterable[str], axis: int, ndims: int, dtype: str, globals: Dict[str, Any]) -> Dict[str, Any]:   
+
+    if isinstance(original_funcs, Callable):
+        original_funcs = [original_funcs]
+    final_func_callmap_name, final_form = AstModifier(original_funcs = original_funcs, index = index, axis = axis, ndims = ndims)
+
+    name_with_id = final_func_callmap_name
+
+    if ndims == 2:
+        final_name =  "vlopt_" + final_func_callmap_name 
         if axis > 1:
             raise ValueError    
-        result['modified'] = {"name": final_name, "source_code": _make_func(two_dim_axis_0 if axis == 0 else two_dim_axis_1, modified_name, modified, dtype, fuid, callmap)}
-        result["modified"]["function"] = _compile_tree(result["modified"], globals)
-        if vectorized is not None:
-            vectorized_name = name_with_id + '_vectorized'
-            result['vectorized'] = {"name": vectorized_name, "source_code": vectorized}
-            result["vectorized"]["function"] = _compile_tree(result["vectorized"], globals)
+        result = {"name": final_name, "source_code": _make_func(two_dim, final_func_callmap_name, final_form, dtype, "0" if axis else "1", "[i, :]" if axis else "[:, i]", len(original_funcs))}
+        result["function"] = _compile_tree(result, globals)
         return result
     elif ndims == 3:
-        raise NotImplemented
+        final_name =  "vlopt_" + final_func_callmap_name 
+        if axis > 1:
+            raise ValueError    
+        result = {"name": final_name, "source_code": _make_func(two_dim, final_func_callmap_name, final_form, dtype, "0" if axis else "1", "[i, :]" if axis else "[:, i]", len(original_funcs))}
+        result["function"] = _compile_tree(result, globals)
+        return result
+
+
+# def _compile_tree(func: Dict[str, str], globals: Dict[str, Any]) -> Dict:
+#     def wrapped(x):
+#         if func['name'] not in globals:
+#             exec(compile(ast.parse(func['source_code']), filename=fp.name, mode="exec"), globals)
+#         return globals[func['name']](x)
+#     wrapped.__name__ = func['name']
+#     wrapped.__qualname__ = "__numba__." + func['name']
+#     return wrapped
+
+# def _prepare_func(original_func: Callable, index: Iterable[str], axis: int, ndims: int, dtype: str, globals: Dict[str, Any]) -> Tuple[ast.AST, ast.AST, ast.AST]:
+#     result = {}
+#     fuid, original_name, original, modified, vectorized, callmap = AstModifier(original_func = original_func, index = index, axis = axis, ndims = ndims)
+#     name_with_id = original_func.__name__ + fuid
+#     result['original'] = {"name":  name_with_id + "_original", "source_code": original}
+#     result["original"]["function"] = _compile_tree(result["original"], globals)
+#     if ndims == 1:
+#         decorator =  "@nb.njit(nb.{dtype}(nb.{dtype}[:]), cache = False, fastmath=True, forceinline=True, looplift=True, inline='always', target_backend='host', no_cfunc_wrapper=True, no_rewrites=True, nogil=True)\n"
+#         result['modified'] = decorator + modified
+#         return result
+#     elif ndims == 2:
+#         final_name =  "vlopt_" + fuid 
+#         modified_name = name_with_id + "_modified"
+#         if axis > 1:
+#             raise ValueError    
+#         result['modified'] = {"name": final_name, "source_code": _make_func(two_dim_axis_0 if axis == 0 else two_dim_axis_1, modified_name, modified, dtype, fuid)}
+#         result["modified"]["function"] = _compile_tree(result["modified"], globals)
+#         if vectorized is not None:
+#             vectorized_name = name_with_id + '_vectorized'
+#             result['vectorized'] = {"name": vectorized_name, "source_code": vectorized}
+#             result["vectorized"]["function"] = _compile_tree(result["vectorized"], globals)
+#         return result
+#     elif ndims == 3:
+#         raise NotImplemented
