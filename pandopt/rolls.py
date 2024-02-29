@@ -2,11 +2,11 @@ from pandas.core.window.rolling import Rolling
 import pandas
 import logging
 from typing import Callable, Type, Dict, Tuple, Any
-from numpy.lib.stride_tricks import sliding_window_view
+
 import pandopt
 logger = logging.getLogger()
 logger.setLevel(0)
-
+from .transfcoders import _prepare_func
 
 class RollOpt(pandas.core.window.rolling.Rolling):
     """
@@ -41,7 +41,7 @@ class RollOpt(pandas.core.window.rolling.Rolling):
 
     _outside_call = True
 
-    def __init__(self, df: 'pandopt.DataFrame', window: int, *args, **kwargs):
+    def __init__(self, df, window: int, *args, **kwargs):
         """
         Initialize a new instance of the RollOpt class.
 
@@ -62,48 +62,59 @@ class RollOpt(pandas.core.window.rolling.Rolling):
         """
 
         self._idf = pandopt.DataFrame(df) if not isinstance(df, (pandopt.DataFrame, pandopt.RollOpt)) else df
+        self._window = window
         super().__init__(self._idf, window=window, *args, **kwargs)
 
-    def apply(self, func: Callable, axis: int = 0, *args, pandas_fallback: bool = False, raw: bool = True, **kwargs) -> 'pandopt.DataFrame':
+    def apply(self, funcs, axis = None, *args, **kwargs):
         """
-        Apply a function to each rolling window.
+        Apply a function along an axis of the DataFrame with enhanced capabilities.
 
         Parameters
         ----------
-        func : Callable
-            The function to apply to each window.
-        axis : int, default 0
-            The axis along which to apply the function.
+        func : callable
+            The function to apply to each column or row.
+        axis : {0 or ‘index’, 1 or ‘columns’}, default None
+            Axis along which the function is applied:
+            - 0 or ‘index’: apply function to each column.
+            - 1 or ‘columns’: apply function to each row.
         pandas_fallback : bool, default False
-            If True, use the standard pandas apply method in case of errors or limitations.
-        raw : bool, default True
-            Determines if the function receives a window of raw data or a Series/DataFrame.
+            If True, use the standard pandas apply method for cases where the optimized apply cannot be used.
+        data : ndarray, optional
+            An optional data parameter for internal use in optimized computations.
+        new_index : array-like, optional
+            The index for the resulting DataFrame after applying the function.
+        from_rolling : bool, default False
+            Indicator whether the apply is being called from a rolling window context.
         *args, **kwargs
             Additional arguments and keyword arguments passed to the function.
 
         Returns
         -------
-        pandopt.DataFrame
-            A DataFrame with the results of applying the function over the rolling window.
+        DataFrame
+            A new DataFrame with the applied function results.
 
         Examples
         --------
         >>> import pandopt
         >>> custom_df = pandopt.DataFrame(data)
-        >>> roll_opt = custom_df.rolling(window=3)
-        >>> result = roll_opt.apply(sum)
+        >>> result_df = custom_df.apply(some_function, axis=1)
         """
-
+        if len((dtypes:=set(self._idf.dtypes)))>1:
+            return super().apply(funcs, axis, **kwargs)
+        if isinstance(funcs, Callable):
+            funcs = [funcs]
+        dtype = str(dtypes.pop())
+        prepared = _prepare_func(funcs, self._idf.index, axis = axis or 0, ndims = 3, dtype = dtype, globals=self._idf.__class__._compiled_env)
         try:
-            data = sliding_window_view(self._idf.to_numpy(), self.window, axis=0)
-            r = self._idf.apply(func, axis = axis, *args, data = data, pandas_fallback=pandas_fallback, new_index =self._idf.index[self.window-1:], from_rolling = True,**kwargs)
-            return r 
+            result = prepared['function'](self._idf.to_numpy(), self._window)
+            result = pandopt.DataFrame(result, index = self._idf.index[self._window - 1:], columns = [func.__name__ for func in funcs] if axis else [(func.__name__, column) for func in funcs for column in self._idf.columns])
+            return result
         except Exception as e:
-            logger.warning(f'Error in pandoptRoll apply: {e}')
-            if pandas_fallback:
-                return super().apply(func, *args, **kwargs)
-            raise e
-    
+            print(e)
+        
+        return super().apply(funcs, self.window, axis, **kwargs)
+
+
     # def aggregate(self, func, *args, **kwargs):
     #     if isinstance(func, dict):
     #         result = {}

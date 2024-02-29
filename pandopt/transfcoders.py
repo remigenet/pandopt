@@ -9,7 +9,7 @@ import numpy as np
 from functools import reduce
 import numba as nb
 import hashlib
-
+from numpy.lib.stride_tricks import sliding_window_view
 
 def source_parser(f):
     source = inspect.getsource(f)
@@ -254,7 +254,10 @@ def AstModifier(original_funcs, index, axis, ndims):
 
     final_func_callmap, final_func_callmap_name = create_func_callmap_function_ast(modified_names)
 
-    decorator = "@nb.njit(nb.PLACEHOLDERDTYPE(nb.PLACEHOLDERDTYPE[:]), cache=True, fastmath=True, forceinline=True, looplift=True, inline='always', target_backend='host', no_cfunc_wrapper=True, no_rewrites=True, nogil=True)\n"
+    if ndims == 3 and axis == 1:
+        decorator = "@nb.njit(nb.PLACEHOLDERDTYPE(nb.types.Array(nb.types.PLACEHOLDERDTYPE, 2, 'A', readonly=True)), cache=True, fastmath=True, forceinline=True, looplift=True, inline='always', target_backend='host', no_cfunc_wrapper=True, no_rewrites=True, nogil=True)\n"
+    else:
+        decorator = "@nb.njit(nb.PLACEHOLDERDTYPE(nb.PLACEHOLDERDTYPE[:]), cache=True, fastmath=True, forceinline=True, looplift=True, inline='always', target_backend='host', no_cfunc_wrapper=True, no_rewrites=True, nogil=True)\n"
 
     final_text = decorator + decorator.join(modified_funcs) + "\n"
     final_text += final_func_callmap
@@ -283,34 +286,34 @@ def vlopt_PLACEHOLDERNAME(z):
 three_dim_axis_0 = """
 PLACEHOLDERFUNC
 
-@nb.njit((nb.PLACEHOLDERDTYPE[:,:,:], nb.PLACEHOLDERDTYPE[:, :],nb.types.uint32, nb.types.uint32), cache=True, parallel=True, fastmath=True, forceinline=True, looplift=True, inline='always', target_backend='host', no_cfunc_wrapper=True, no_rewrites=True, nogil=True)
+@nb.njit((nb.types.Array(nb.types.PLACEHOLDERDTYPE, 3, 'A', readonly=True), nb.PLACEHOLDERDTYPE[:, :],nb.types.uint32, nb.types.uint32), cache=True, parallel=True, fastmath=True, forceinline=True, looplift=True, inline='always', target_backend='host', no_cfunc_wrapper=True, no_rewrites=True, nogil=True)
 def cvlopt_PLACEHOLDERNAME(z, r, n, m):
     for i in nb.prange(n):
         for j in nb.prange(PLACEHOLDERNFUNC):
             for k in nb.prange(m):
-                r[i, j * k + j] = PLACEHOLDERNAME(j, z[i, k, :])
+                r[i, j * k + k] = PLACEHOLDERNAME(j, z[i, k, :])
 
-def vlopt_PLACEHOLDERNAME(z):
-    n = np.uint32(z.shape[0])  # Determine the number of rows in z
-    m = np.uint32(z.shape[1])  # Determine the number of rows in z
-    r = np.empty((n, PLACEHOLDERNFUNC * m), dtype=np.PLACEHOLDERDTYPE)  # Initialize the result array
-    cvlopt_PLACEHOLDERNAME(z, r, n, m)
+def vlopt_PLACEHOLDERNAME(arr, window):
+    n = np.uint32(arr.shape[0]) - window + 1  
+    m = np.uint32(arr.shape[1]) 
+    r = np.zeros((n, PLACEHOLDERNFUNC * m), dtype=np.PLACEHOLDERDTYPE)  # Initialize the result array
+    cvlopt_PLACEHOLDERNAME(sliding_window_view(arr, window, axis=0), r, n, m)
     return r
 """
 
 three_dim_axis_1 = """
 PLACEHOLDERFUNC
 
-@nb.njit((nb.PLACEHOLDERDTYPE[:,:,:], nb.PLACEHOLDERDTYPE[:, :],nb.types.uint32), cache=True, parallel=True, fastmath=True, forceinline=True, looplift=True, inline='always', target_backend='host', no_cfunc_wrapper=True, no_rewrites=True, nogil=True)
+@nb.njit((nb.types.Array(nb.types.PLACEHOLDERDTYPE, 3, 'A', readonly=True), nb.PLACEHOLDERDTYPE[:, :],nb.types.uint32), cache=True, parallel=True, fastmath=True, forceinline=True, looplift=True, inline='always', target_backend='host', no_cfunc_wrapper=True, no_rewrites=True, nogil=True)
 def cvlopt_PLACEHOLDERNAME(z, r, n):
     for i in nb.prange(n):
         for j in nb.prange(PLACEHOLDERNFUNC):
             r[i, j] = PLACEHOLDERNAME(j, z[i,:,:])
 
 def vlopt_PLACEHOLDERNAME(arr, window):
-    n = np.uint32(z.shape[0])  # Determine the number of rows in z
-    r = np.empty((n - window + 1, PLACEHOLDERNFUNC), dtype=np.PLACEHOLDERDTYPE)  # Initialize the result array
-    cvlopt_PLACEHOLDERNAME(sliding_window_view(arr, window, axis=0), r, n)
+    n = np.uint32(arr.shape[0]) - window + 1  
+    r = np.zeros((n , PLACEHOLDERNFUNC), dtype=np.PLACEHOLDERDTYPE)  # Initialize the result array
+    cvlopt_PLACEHOLDERNAME(sliding_window_view(arr, window, axis=0), r, n - 1)
     return r
 """
 
@@ -325,10 +328,10 @@ def _make_func(base_model: str, name: str, func: str, dtype: str, axis: str, axi
     
 
 def _compile_tree(func: Dict[str, str], exec_globals: Dict[str, Any]) -> Dict:
-    def wrapped(x):
+    def wrapped(*args):
         if func['name'] not in exec_globals:
             exec(compile(ast.parse(func['source_code']), filename="/tmp/numbacache", mode="exec"), exec_globals)
-        return exec_globals[func['name']](x)
+        return exec_globals[func['name']](*args)
     wrapped.__name__ = func['name']
     wrapped.__qualname__ = "__numba__." + func['name']
     return wrapped
@@ -350,9 +353,10 @@ def _prepare_func(original_funcs: Callable, index: Iterable[str], axis: int, ndi
         return result
     elif ndims == 3:
         final_name =  "vlopt_" + final_func_callmap_name 
+        globals.update({'sliding_window_view': sliding_window_view})
         if axis > 1:
             raise ValueError    
-        result = {"name": final_name, "source_code": _make_func(two_dim, final_func_callmap_name, final_form, dtype, "0" if axis else "1", "[i, :]" if axis else "[:, i]", len(original_funcs))}
+        result = {"name": final_name, "source_code": _make_func(three_dim_axis_1 if axis else three_dim_axis_0, final_func_callmap_name, final_form, dtype, "", "", len(original_funcs))}
         result["function"] = _compile_tree(result, globals)
         return result
 
