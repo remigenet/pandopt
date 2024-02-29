@@ -61,19 +61,33 @@ Pandopt just means pandas optimized - still it don't search to cover use cases l
 Eard about the famous "apply" method that is so slow ? Pandopt can make it up to 14000 times faster, depending on the function you are applying. Yeah, you read it right. But that's not all, the rolling method can also be up to 1000 times faster, in fact all the basics unleash real potential !
 You can find the benchmarks in the demos_n_examples folder, where pandopt library is able to bit even polars on some of the most basics tasks like summing, while maintaining a fully compatible API with pandas.
 
+The other advantage is that if using apply with multiple functions the gains can be even higher, with seen benchmarks going to 25,000X quicker ! 
+
 ## What works now ?
 
 Apply methods start to be well tested and the rolling window method is integration is done too. After multiple tests, either using numpy memory layout, pyarrow indexing, and numba, improving the groupby outside of the box seems much more complicated than expected and this is not planned for the moment.
 However you can find tests and benchmarks in notebooks:
-    - [Apply function in Notebook](demos_n_examples/apply_benchmarks.ipynb)
-    - [Apply function in Notebook](demos_n_examples/rolling_benchmarks.ipynb)
+    - [Apply](demos_n_examples/Benchmarks/apply_benchmarks.ipynb)
+    - [Rolling](demos_n_examples/Benchmarks/rolling_benchmarks.ipynb)
+  
+
+## Some helps to understand how it works ?
+
+While creating I made several notebook to explain the ideas:
+    - [Understand how even a simple sum can have drastic performance changes](demos_n_examples/UnderstandHowItWork/ManyWayToSum.ipynb)
+    - [Apply intermediary version](demos_n_examples/UnderstandHowItWork/TheCodeTransformation.ipynb): showcase how to also implements with vectorization if possible, removed for simplicity when having multiple column due to time lack but more efficient than current implementation
+    - [Apply Current explanation](demos_n_examples/UnderstandHowItWork/TheCodeTransformation_NewVersion.ipynb)
+    - [How rolling is performed](demos_n_examples/UnderstandHowItWork/Rolling.ipynb)
   
 
 ## Versioning and dependencies ?
 
 Pandopt idea is to be as general as posisible, and to be as compatible as possible with the pandas API. It's also to be as light as possible, and to not add any dependencies that are not strictly necessary. In that meaning it only requires the numpy and numba library for optimisation, that are not from standard library, but are very common and very well maintained. 
 pandopt class directly inherit from pandas class, and is not meant to be used as a standalone library, but as a drop-in replacement for pandas, so it's versioning is directly linked to the pandas versioning, and it's compatibility is directly linked to the pandas compatibility.
-In addition to inherit, it use decorators to avoid "leaving" the class, and to ensure that the methods are not overriden by the pandas methods, and that the class is not overriden by the pandas class.
+
+## Bugs and current stability ?
+
+It's a personal project for now on the side, it's for sure unsafe and there is still many bugs lying around !
 
 ## Ideas tested
 
@@ -92,37 +106,149 @@ Multiple ideas have been tested and compared to provide this package, here is a 
 
 To achieve this the dataframe will create 4 options, two using direct vectorization to retrieve the datas in the array directly, the second using a numba loop, for each version having one compiled and one not compuled. To do so it's fully dynamic and the apply is creating this derivated function from the initial one using AST parsing and modifcation. 
 
-For example _prepare_funcs will transform your function test_func that is like:
+For example _prepare_funcs will transform your functions here:
 
 ```python
-def test_func(z):
-    x = (z['A']+z['B'])
-    x = z['B']*z['D']
+def simple_start(z):
+    x = (z['A'] + z['B']) / z['C']
+    x += z['B'] * z['D']
     return x / z['B']
+
+def harder_func(z):
+    x = (z['A'] + z['B']) / z['C']
+    if x > 0:
+        return x / z['B']
+    x += z['B'] * z['D']
+    return x * z['B']
+
+def harder2_func(z):
+    x = (z['A'] + z['B']) / z['C']
+    k=z['A']-z['C']
+    j=z['B']/z['D']
+    if k > j:
+        return x / k
+    x *= j
+    return x - k if k > z['C'] else x + k
+
+
+def harder3_func(z):
+    g=lambda a, b: a if abs(a) > abs(b) else - 2 * (b**(-a))
+    x = (z['A'] + z['B']) / z['C']
+    k=z['A' if z['B'] > 0 else 'D']-z['C']
+    j=g(z['B'],z['D'])
+    if k > j:
+        return j / k
+    x *= j
+    return x - k if k > z['C'] else x + k
+
+def harder4_func(z):
+    g=lambda a, b: a if abs(a) > abs(b) else - 2 * (b**(-int(a)))
+    x = (z['A'] + z['B']) / z['C']
+    k=z['A' if z['B'] > 0 else 'D']-z['C']
+    j=g(z['B'],z['D'])
+    if k > j:
+        return j / k
+    x *= j
+    return x - k if k > z['C'] else x + k
+
+
+df = pd.DataFrame(np.random.randn(int(1e4), 4), columns=['A', 'B', 'C', 'D']).astype(np.float32)
+
+func_list = [simple_start, harder_func, harder2_func, harder3_func, harder4_func]
+
+prepared = _prepare_func(func_list, df.columns.values.astype(str) if axis==1 else df.index.values.astype(str), axis = axis, ndims = 2, dtype = "float32")
+
+print(prepared['source_code'])
+
 ```
-Into this one for the loop method:
+So that the source code that will be compiled became:
 ```python
-@nb.jit(nopython=True, nogil=True, parallel=True, OTHER flags...)
-def cdmtest_func(Z):
-    def callmap(x):
-        if x == 'A':
-            return 0
-        elif x == 'B':
-            return 1
-        elif x == 'C':
-            return 2
-        elif x == 'D':
-            return 3
-        return x
-    def tmporary(x):
-        x = (z[callmap('A')]+z[callmap('B')])
-        x = z[callmap('B')]*z[callmap('D')]
-        return x / z[callmap('B')]
-    n = Z.shape[0]
-    res = np.zeros((n, 1))
-    for i in nb.prange(5, n):
-        res[i,0] = np.var(Z[i,:])
-    return res
+@nb.njit(nb.uint8(nb.types.string), cache=True, parallel=True, fastmath=True, forceinline=True, looplift=True, inline='always', target_backend='host', no_cfunc_wrapper=True, no_rewrites=True, nopython=True, nogil=True)
+def callmap_fb2f85c88567f3c8ce9b799c7c54642d0c7b41f6(x):
+    if x == 'A':
+        return 0
+    if x == 'B':
+        return 1
+    if x == 'C':
+        return 2
+    if x == 'D':
+        return 3
+    return 4
+
+@nb.njit(nb.float32(nb.float32[:]), cache=True, fastmath=True, forceinline=True, looplift=True, inline='always', target_backend='host', no_cfunc_wrapper=True, no_rewrites=True, nogil=True)
+def simple_startfb2f85c88567f3c8ce9b799c7c54642d0c7b41f6_modified(zX):
+    x = (zX[0] + zX[1]) / zX[2]
+    x += zX[1] * zX[3]
+    return x / zX[1]
+
+@nb.njit(nb.float32(nb.float32[:]), cache=True, fastmath=True, forceinline=True, looplift=True, inline='always', target_backend='host', no_cfunc_wrapper=True, no_rewrites=True, nogil=True)
+def harder_funcfb2f85c88567f3c8ce9b799c7c54642d0c7b41f6_modified(zX):
+    x = (zX[0] + zX[1]) / zX[2]
+    if x > 0:
+        return x / zX[1]
+    x += zX[1] * zX[3]
+    return x * zX[1]
+
+@nb.njit(nb.float32(nb.float32[:]), cache=True, fastmath=True, forceinline=True, looplift=True, inline='always', target_backend='host', no_cfunc_wrapper=True, no_rewrites=True, nogil=True)
+def harder2_funcfb2f85c88567f3c8ce9b799c7c54642d0c7b41f6_modified(zX):
+    x = (zX[0] + zX[1]) / zX[2]
+    k = zX[0] - zX[2]
+    j = zX[1] / zX[3]
+    if k > j:
+        return x / k
+    x *= j
+    return x - k if k > zX[2] else x + k
+
+@nb.njit(nb.float32(nb.float32[:]), cache=True, fastmath=True, forceinline=True, looplift=True, inline='always', target_backend='host', no_cfunc_wrapper=True, no_rewrites=True, nogil=True)
+def harder3_funcfb2f85c88567f3c8ce9b799c7c54642d0c7b41f6_modified(zX):
+    g = lambda a, b: a if abs(a) > abs(b) else -2 * b ** (-a)
+    x = (zX[0] + zX[1]) / zX[2]
+    k = zX[callmap_fb2f85c88567f3c8ce9b799c7c54642d0c7b41f6('A' if zX[1] > 0 else 'D')] - zX[2]
+    j = g(zX[1], zX[3])
+    if k > j:
+        return j / k
+    x *= j
+    return x - k if k > zX[2] else x + k
+
+@nb.njit(nb.float32(nb.float32[:]), cache=True, fastmath=True, forceinline=True, looplift=True, inline='always', target_backend='host', no_cfunc_wrapper=True, no_rewrites=True, nogil=True)
+def harder4_funcfb2f85c88567f3c8ce9b799c7c54642d0c7b41f6_modified(zX):
+    g = lambda a, b: a if abs(a) > abs(b) else -2 * b ** (-int(a))
+    x = (zX[0] + zX[1]) / zX[2]
+    k = zX[callmap_fb2f85c88567f3c8ce9b799c7c54642d0c7b41f6('A' if zX[1] > 0 else 'D')] - zX[2]
+    j = g(zX[1], zX[3])
+    if k > j:
+        return j / k
+    x *= j
+    return x - k if k > zX[2] else x + k
+
+
+@nb.njit(nb.float32(nb.uint8, nb.float32[:]), cache=True, parallel=True, fastmath=True, forceinline=True, looplift=True, inline='always', target_backend='host', no_cfunc_wrapper=True, no_rewrites=True, nogil=True)
+def func_callmap_simple_startfb2f85c88567f3c8ce9b799c7c54642d0c7b41f(idx, x):
+    if idx == 0:
+        return simple_startfb2f85c88567f3c8ce9b799c7c54642d0c7b41f6_modified(x)
+    if idx == 1:
+        return harder_funcfb2f85c88567f3c8ce9b799c7c54642d0c7b41f6_modified(x)
+    if idx == 2:
+        return harder2_funcfb2f85c88567f3c8ce9b799c7c54642d0c7b41f6_modified(x)
+    if idx == 3:
+        return harder3_funcfb2f85c88567f3c8ce9b799c7c54642d0c7b41f6_modified(x)
+    if idx == 4:
+        return harder4_funcfb2f85c88567f3c8ce9b799c7c54642d0c7b41f6_modified(x)
+    return harder4_funcfb2f85c88567f3c8ce9b799c7c54642d0c7b41f6_modified(x)
+
+@nb.njit((nb.float32[:,:], nb.float32[:, :],nb.types.uint32), cache=True, parallel=True, fastmath=True, forceinline=True, looplift=True, inline='always', target_backend='host', no_cfunc_wrapper=True, no_rewrites=True, nogil=True)
+def cvlopt_func_callmap_simple_startfb2f85c88567f3c8ce9b799c7c54642d0c7b41f(z, r, n):
+    for i in nb.prange(n):
+        for j in nb.prange(5):
+            r[i, j] = func_callmap_simple_startfb2f85c88567f3c8ce9b799c7c54642d0c7b41f(j, z[i, :])
+
+def vlopt_func_callmap_simple_startfb2f85c88567f3c8ce9b799c7c54642d0c7b41f(z):
+    n = np.uint32(z.shape[0])  # Determine the number of rows in z
+    r = np.empty((n, 5), dtype=np.float32)  # Initialize the result array
+    cvlopt_func_callmap_simple_startfb2f85c88567f3c8ce9b799c7c54642d0c7b41f(z, r, n)
+    return r
+
+
 ```
 
 The compiled and non compiled version are created and the best one is used, if fails goes to next until finding a working one, and at worst get back to default behaviour.
