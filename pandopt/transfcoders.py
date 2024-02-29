@@ -4,19 +4,16 @@ import inspect
 import logging
 import functools
 import sys
-from typing import Callable, Type, Dict, Tuple, Any, Union
+from typing import Callable, Type, Dict, Tuple, Any, Union, Iterable, List, Optional
 import numpy as np
+from functools import reduce
 import numba as nb
 import hashlib
-logger = logging.getLogger()
-logger.setLevel(0)
+from numpy.lib.stride_tricks import sliding_window_view
 
-
-
-
-def source_parser(f, *, mapping):
+def source_parser(f):
     source = inspect.getsource(f)
-    if any(source.startswith(managed_method.__name__) for managed_method in [apply, aggregate, myparser_func]):
+    if any(source.startswith(managed_method) for managed_method in ["apply", "aggregate", "source_parser"]):
         code = "    return " + source[source.find('x:') + 2:source.find('mapping')].strip().strip(',').strip(':').strip(')')
     elif f.__module__ != '__main__':
         code = "    import " + f.__module__ + '\n'
@@ -28,42 +25,17 @@ def source_parser(f, *, mapping):
 def f{uid}(x):
 {code} 
     """)
+    
 
-def create_callmap_function_ast(mapping: Dict[str, int]) -> ast.FunctionDef:
-    """
-    Create an abstract syntax tree (AST) for a function that maps arguments based on a provided mapping.
+def create_if_callmap_function_ast(index: Iterable[str], fuid: str) -> ast.FunctionDef:
 
-    This function generates a FunctionDef node in an AST, representing a function
-    that transforms its input based on a specified mapping dictionary.
-
-    Parameters
-    ----------
-    mapping : Dict[str, int]
-        A dictionary mapping strings to integers, used to transform the function's input.
-
-    Returns
-    -------
-    ast.FunctionDef
-        The AST node representing the defined function.
-
-    Examples
-    --------
-    >>> mapping = {"a": 1, "b": 2}
-    >>> func_ast = create_callmap_function_ast(mapping)
-    >>> print(ast.dump(func_ast))
-    """
 
     body = []
-    for key, value in mapping.items():
-        try:
-            key = int(key)
-            continue
-        except ValueError:
-            key = ast.Constant(value=key)
+    for value, key in enumerate(index):
         compare = ast.Compare(
             left=ast.Name(id='x', ctx=ast.Load()),
             ops=[ast.Eq()],
-            comparators=[key]
+            comparators=[ast.Constant(value = key)]
         )
         body.append(
             ast.If(
@@ -74,35 +46,11 @@ def create_callmap_function_ast(mapping: Dict[str, int]) -> ast.FunctionDef:
         )
     
     # Add a default return statement
-    body.append(ast.Return(value=ast.Name(id='x', ctx=ast.Load())))
+    body.append(ast.Return(value=ast.Constant(value=value+1)))
 
-    # Create the Numba JIT decorator with specified options
-    numba_decorator = ast.Call(
-        func=ast.Attribute(value=ast.Name(id='nb', ctx=ast.Load()), attr='njit', ctx=ast.Load()),
-        args=[
-            ast.Call(
-                func=ast.Attribute(value=ast.Name(id='nb', ctx=ast.Load()), attr='int8', ctx=ast.Load()),
-                args=[ast.Attribute(value=ast.Name(id='nb', ctx=ast.Load()), attr='types.string', ctx=ast.Load())],
-                keywords=[]
-            )
-        ],
-        keywords=[
-            ast.keyword(arg='cache', value=ast.Constant(value=True)),
-            ast.keyword(arg='parallel', value=ast.Constant(value=True)),
-            ast.keyword(arg='fastmath', value=ast.Constant(value=True)),
-            ast.keyword(arg='forceinline', value=ast.Constant(value=True)),
-            ast.keyword(arg='looplift', value=ast.Constant(value=True)),
-            ast.keyword(arg='inline', value=ast.Constant(value='always')),
-            ast.keyword(arg='target_backend', value=ast.Constant(value='host')),
-            ast.keyword(arg='no_cfunc_wrapper', value=ast.Constant(value=True)),
-            ast.keyword(arg='no_rewrites', value=ast.Constant(value=True)),
-            ast.keyword(arg='nopython', value=ast.Constant(value=True)),
-            ast.keyword(arg='nogil', value=ast.Constant(value=True)),
-        ]
-    )
     # Create the function definition
     func_def = ast.FunctionDef(
-        name=(callmap_name:=f'callmap{hashlib(reduce(lambda x, y: x + y, mapping.keys()))}'),
+        name=(callmap_name:=f'if_callmap_{hashlib.sha1(fuid.encode("utf-8")).hexdigest()}'),
         args=ast.arguments(
             posonlyargs=[],
             args=[ast.arg(arg='x')],
@@ -113,10 +61,63 @@ def create_callmap_function_ast(mapping: Dict[str, int]) -> ast.FunctionDef:
             defaults=[]
         ),
         body=body,
-        decorator_list=[numba_decorator],
+        decorator_list=[],
         returns=None
     )
-    return func_def, callmap_name
+    
+    callmap_str = ast.unparse(ast.fix_missing_locations(ast.Module(body=[func_def], type_ignores=[])))
+
+    decorator = "@nb.njit(nb.uint8(nb.types.string), cache=True, looplift=True, inline='always', target_backend='host', no_cfunc_wrapper=True, no_rewrites=True, nogil=True)\n"
+    
+    return decorator + callmap_str, callmap_name
+
+def create_func_callmap_function_ast(funcs_list: Iterable[str]) -> ast.FunctionDef:
+
+    
+    body = []
+    for idx, func in enumerate(funcs_list):
+        compare = ast.Compare(
+            left=ast.Name(id='idx', ctx=ast.Load()),
+            ops=[ast.Eq()],
+            comparators=[ast.Constant(value=idx)]
+        )
+        body.append(
+            ast.If(
+                test=compare,
+                body=[ast.Return(value=ast.Call(func=ast.Name(id=func, ctx=ast.Load()),
+                                               args=[ast.Name(id='x', ctx=ast.Load())], 
+                                               keywords=[]))],
+                orelse=[]
+            )
+        )
+    # Add a default return statement
+    body.append(ast.Return(value=ast.Call(func=ast.Name(id=func, ctx=ast.Load()),
+                                               args=[ast.Name(id='x', ctx=ast.Load())], 
+                                               keywords=[])))
+
+
+    # Create the function definition
+    func_def = ast.FunctionDef(
+        name=(callmap_name:=f'func_callmap_{hashlib.sha1("".join((func for func in funcs_list)).encode("utf-8")).hexdigest()}'),
+        args=ast.arguments(
+            posonlyargs=[],
+            args=[ast.arg(arg='idx'), ast.arg(arg='x')],
+            vararg=None,
+            kwonlyargs=[],
+            kw_defaults=[],
+            kwarg=None,
+            defaults=[]
+        ),
+        body=body,
+        decorator_list=[],
+        returns=None
+    )
+    decorator = "@nb.njit(nb.PLACEHOLDERDTYPE(nb.uint8, nb.PLACEHOLDERDTYPE[:]), cache=True, parallel=True, fastmath=True, forceinline=True, looplift=True, inline='always', target_backend='host', no_cfunc_wrapper=True, no_rewrites=True, nogil=True)\n"
+    
+    callmap_str = ast.unparse(ast.fix_missing_locations(ast.Module(body=[func_def], type_ignores=[])))
+
+    return decorator + callmap_str, callmap_name
+
 class SubscriptReplacer(ast.NodeTransformer):
     """
     AST Node Transformer to replace subscript expressions in a function's AST.
@@ -140,7 +141,7 @@ class SubscriptReplacer(ast.NodeTransformer):
     >>> modified_tree = replacer.visit(original_tree)
     """
     
-    def __init__(self, arg_name: str, callmap_name: str, axis: int, ndims : int):
+    def __init__(self, arg_name: str, new_var_name: str, index: List[str], for_vectorize_form: bool, axis: int, ndims : int, callmap_name: Optional[str] = None, callmap_def: Optional[str] = None):
         """
         Initialize the SubscriptReplacer with the specified argument name.
 
@@ -155,451 +156,241 @@ class SubscriptReplacer(ast.NodeTransformer):
         """
 
         self.arg_name = arg_name
+        self.new_var_name = new_var_name
         self.callmap_name = callmap_name
+        self.callmap_def = callmap_def
+        self.index = index
+        self.for_vectorize_form = for_vectorize_form
         self.axis = axis
         self.ndims = ndims
+        self.used = False
+        self.vectorizable = True
+        self.fuid = '_general_'
 
+    
     def visit_Subscript(self, node):
         if isinstance(node.value, ast.Name) and node.value.id == self.arg_name:
             # Check for Python version compatibility
+            if self.fuid == '_general_':
+                self.fuid = hashlib.sha1("".join(self.index.astype(str)).encode("UTF-8")).digest().hex()
             if sys.version_info >= (3, 9):
                 # Python 3.9 and later
                 old_slice = node.slice
             else:
                 # Python 3.8 and earlier
                 old_slice = node.slice.value if isinstance(node.slice, ast.Index) else node.slice
-
-            node.slice = ast.Tuple(
-               elts=[
-                  ast.Slice() if i != self.axis else
-                  ast.Call(
+            if isinstance(old_slice, ast.Constant) and len((idxs:=np.where(self.index==old_slice.value)[0]))==1:
+                new_value = ast.Constant(value = idxs[0])
+            else:
+                if self.callmap_name is None:
+                    self.callmap_def, self.callmap_name = create_if_callmap_function_ast(self.index, self.fuid)
+                new_value = ast.Call(
                         func=ast.Name(id=self.callmap_name, ctx=ast.Load()),
                         args=[old_slice],
                         keywords=[]
-                    ) for i in range(self.ndims)],
-               ctx=ast.Load())
+                    )
+                self.vectorizable = False
+            if self.for_vectorize_form:
+                node.slice = ast.Tuple(
+                   elts=[
+                       ast.Slice() if i != self.axis
+                       else new_value
+                       for i in range(self.ndims)],
+                   ctx=ast.Load())
+            else:
+                node.slice = new_value
+            node.value.id = self.new_var_name 
             # Wrap the subscript in a call to callmap
         return self.generic_visit(node) 
 
+    def visit_If(self, node):
+        self.vectorizable = False
+        return self.generic_visit(node) 
 
-def create_transformed_function_ast(original_func: Callable, callmap_name, axis = 0, ndims = 2, D3_to_D2: bool = False, no_vectorized: bool = False) -> Tuple[ast.AST, ast.AST, ast.AST]:
-    """
-    Create transformed versions of a given function as abstract syntax trees (ASTs).
+    def visit_IfExp(self, node):
+        self.vectorizable = False
+        return self.generic_visit(node) 
 
-    This function generates ASTs for different versions of a given function, incorporating
-    specific transformations and optimizations based on the provided parameters.
+    def visit_With(self, node):
+        self.vectorizable = False
+        return self.generic_visit(node) 
 
-    Parameters
-    ----------
-    original_func : Callable
-        The original function to transform.
-    mapping : Dict[str, int]
-        A mapping dictionary to be used in the transformed function.
-    func_int_identifier : str
-        A unique identifier for the function being transformed.
-    D3_to_D2 : bool, default False
-        Flag indicating if the function involves 3D to 2D array transformation.
-    no_vectorized : bool, default False
-        Flag indicating if the function should avoid vectorized implementation.
-
-    Returns
-    -------
-    Tuple[ast.AST, ast.AST, ast.AST]
-        A tuple containing ASTs for loop-based, vectorized, and loop-based compiled versions of the function.
-
-    Examples
-    --------
-    >>> def original_function(x):
-    >>>     return x + 1
-    >>> mapping = {'x': 0}
-    >>> func_ast, loop_ast, vector_ast = create_transformed_function_ast(original_function, mapping, 'func_id')
-    """
+    def visit_While(self, node):
+        self.vectorizable = False
+        return self.generic_visit(node) 
     
-    # Parse the original function
-    source_code = source_parser(original_func)
-    original_tree = ast.parse(source_code)
-    
-    arg_name = original_tree.body[0].args.args[0].arg
-    original_tree.body[0].name = f'f{uid}'
-    replacer = SubscriptReplacer(arg_name, callmap_name, axis = axis, ndims = ndims)
-    if "if" not in original_func:
+    def visit_Name(self, node):
+        if node.id == self.arg_name:
+            self.vectorizable = False
+            node.id = self.new_var_name
+        return self.generic_visit(node) 
 
-        vectorize_tree = copy.deepcopy(original_tree)
-        vectorize_tree = replacer.visit(vectorize_tree)
-        ast.fix_missing_locations(vectorize_tree)
+def AstModifier(original_funcs, index, axis, ndims):
+
+    callmap_name, callmap_def = None, None
+    modified_funcs, modified_names = [], []
+    for original_func in original_funcs:
+        modified_tree, vectorize_tree = None, None
+        source_code = source_parser(original_func)
+        original_tree = ast.parse(source_code)
+    
+        arg_name = original_tree.body[0].args.args[0].arg
+        new_name = arg_name + "X"
+        while new_name in source_code:
+            new_name + "X"
+            
+        replacer = SubscriptReplacer(arg_name, new_name, index, for_vectorize_form=False, axis = axis, ndims = ndims, callmap_name = callmap_name, callmap_def = callmap_def)
         
-        vectorize_tree_opt = copy.deepcopy(vectorize_tree)
-        vectorize_tree.body[0].name += '_vectorized'
-        vectorize_tree_opt.body[0].name += '_vectorized_opt'
-        vectorize_tree_opt = numba_decorate(vectorize_tree_opt)
+        modified_tree = copy.deepcopy(original_tree)
+        modified_tree = replacer.visit(modified_tree)
+        callmap_name, callmap_def = replacer.callmap_name, replacer.callmap_def
+        ast.fix_missing_locations(modified_tree)
+        fuid = original_func.__name__ + replacer.fuid  + str(axis)
+        modified_tree.body[0].args.args[0].arg = new_name
+        modified_tree.body[0].name = f'f{hashlib.sha1((fuid).encode("utf-8")).hexdigest()}'
+        ast.fix_missing_locations(modified_tree)
+        modified_funcs.append(ast.unparse(modified_tree) + "\n\n" )
+        modified_names.append(modified_tree.body[0].name)
 
+    final_func_callmap, final_func_callmap_name = create_func_callmap_function_ast(modified_names)
+
+    if ndims == 3 and axis == 1:
+        decorator = "@nb.njit(nb.PLACEHOLDERDTYPE(nb.types.Array(nb.types.PLACEHOLDERDTYPE, 2, 'A', readonly=True)), cache=True, fastmath=True, forceinline=True, looplift=True, inline='always', target_backend='host', no_cfunc_wrapper=True, no_rewrites=True, nogil=True)\n"
+    else:
+        decorator = "@nb.njit(nb.PLACEHOLDERDTYPE(nb.PLACEHOLDERDTYPE[:]), cache=True, fastmath=True, forceinline=True, looplift=True, inline='always', target_backend='host', no_cfunc_wrapper=True, no_rewrites=True, nogil=True)\n"
+
+    final_text = decorator + decorator.join(modified_funcs) + "\n"
+    final_text += final_func_callmap
+    if callmap_def is not None:
+        final_text = callmap_def + "\n\n" + final_text
+    
+    return final_func_callmap_name, final_text
+
+
+two_dim = """
+PLACEHOLDERFUNC
+
+@nb.njit((nb.PLACEHOLDERDTYPE[:,:], nb.PLACEHOLDERDTYPE[:, :],nb.types.uint32), cache=True, parallel=True, fastmath=True, forceinline=True, looplift=True, inline='always', target_backend='host', no_cfunc_wrapper=True, no_rewrites=True, nogil=True)
+def cvlopt_PLACEHOLDERNAME(z, r, n):
+    for i in nb.prange(n):
+        for j in nb.prange(PLACEHOLDERNFUNC):
+            r[i, j] = PLACEHOLDERNAME(j, zPLACEHOLDERAXISSELECT)
+
+def vlopt_PLACEHOLDERNAME(z):
+    n = np.uint32(z.shape[PLACEHOLDERAXIS])  # Determine the number of rows in z
+    r = np.empty((n, PLACEHOLDERNFUNC), dtype=np.PLACEHOLDERDTYPE)  # Initialize the result array
+    cvlopt_PLACEHOLDERNAME(z, r, n)
+    return r
+"""
+
+three_dim_axis_0 = """
+PLACEHOLDERFUNC
+
+@nb.njit((nb.types.Array(nb.types.PLACEHOLDERDTYPE, 3, 'A', readonly=True), nb.PLACEHOLDERDTYPE[:, :],nb.types.uint32, nb.types.uint32), cache=True, parallel=True, fastmath=True, forceinline=True, looplift=True, inline='always', target_backend='host', no_cfunc_wrapper=True, no_rewrites=True, nogil=True)
+def cvlopt_PLACEHOLDERNAME(z, r, n, m):
+    for i in nb.prange(n):
+        for j in nb.prange(PLACEHOLDERNFUNC):
+            for k in nb.prange(m):
+                r[i, j * k + k] = PLACEHOLDERNAME(j, z[i, k, :])
+
+def vlopt_PLACEHOLDERNAME(arr, window):
+    n = np.uint32(arr.shape[0]) - window + 1  
+    m = np.uint32(arr.shape[1]) 
+    r = np.zeros((n, PLACEHOLDERNFUNC * m), dtype=np.PLACEHOLDERDTYPE)  # Initialize the result array
+    cvlopt_PLACEHOLDERNAME(sliding_window_view(arr, window, axis=0), r, n, m)
+    return r
+"""
+
+three_dim_axis_1 = """
+PLACEHOLDERFUNC
+
+@nb.njit((nb.types.Array(nb.types.PLACEHOLDERDTYPE, 3, 'A', readonly=True), nb.PLACEHOLDERDTYPE[:, :],nb.types.uint32), cache=True, parallel=True, fastmath=True, forceinline=True, looplift=True, inline='always', target_backend='host', no_cfunc_wrapper=True, no_rewrites=True, nogil=True)
+def cvlopt_PLACEHOLDERNAME(z, r, n):
+    for i in nb.prange(n):
+        for j in nb.prange(PLACEHOLDERNFUNC):
+            r[i, j] = PLACEHOLDERNAME(j, z[i,:,:])
+
+def vlopt_PLACEHOLDERNAME(arr, window):
+    n = np.uint32(arr.shape[0]) - window + 1  
+    r = np.zeros((n , PLACEHOLDERNFUNC), dtype=np.PLACEHOLDERDTYPE)  # Initialize the result array
+    cvlopt_PLACEHOLDERNAME(sliding_window_view(arr, window, axis=0), r, n - 1)
+    return r
+"""
+
+def _make_func(base_model: str, name: str, func: str, dtype: str, axis: str, axis_select: str, n_funcs: int):
+    final = base_model.replace('PLACEHOLDERNAME', name)
+    final = final.replace('PLACEHOLDERFUNC', func)
+    final = final.replace('PLACEHOLDERDTYPE', dtype)
+    final = final.replace('PLACEHOLDERAXISSELECT', axis_select)
+    final = final.replace('PLACEHOLDERAXIS', axis)
+    final = final.replace('PLACEHOLDERNFUNC', str(n_funcs))
+    return final
+    
+
+def _compile_tree(func: Dict[str, str], exec_globals: Dict[str, Any]) -> Dict:
+    def wrapped(*args):
+        if func['name'] not in exec_globals:
+            exec(compile(ast.parse(func['source_code']), filename="/tmp/numbacache", mode="exec"), exec_globals)
+        return exec_globals[func['name']](*args)
+    wrapped.__name__ = func['name']
+    wrapped.__qualname__ = "__numba__." + func['name']
+    return wrapped
+
+def _prepare_func(original_funcs: Callable, index: Iterable[str], axis: int, ndims: int, dtype: str, globals: Dict[str, Any]) -> Dict[str, Any]:   
+
+    if isinstance(original_funcs, Callable):
+        original_funcs = [original_funcs]
+    final_func_callmap_name, final_form = AstModifier(original_funcs = original_funcs, index = index, axis = axis, ndims = ndims)
+
+    name_with_id = final_func_callmap_name
 
     if ndims == 2:
-        loop_tree = copy.deepcopy(original_tree)
-        loop_tree = replacer.visit(loop_tree)
-        ast.fix_missing_locations(loop_tree)
-        
-        loop_tree_opt = copy.deepcopy(loop_tree)
-        loop_tree.body[0].name += '_uloop_1'
-        loop_tree_opt.body[0].name += '_uloop_1_opt'
-        loop_tree_opt = numba_decorate(loop_tree_opt)
-        loop_tree = ast.unparse(loop_tree) + f"""
-def f{uid}_loop_1(Z, res):
-    for i in nb.prange(n):
-        res[i] = f{uid}_uloop_1(Z[i])
-
-def f{uid}_loop(Z):
-    z=np.zeros(len(Z), dtype=Z.dtype)
-    f{uid}_loop_1(Z, z)
-    return z
-        """
-        loop_tree_opt = ast.unparse(loop_tree_opt) + f"""
-@nb.jit(cache = True, parallel=True, fastmath=True, forceinline=True, looplift=True, inline='always', target_backend='host', no_cfunc_wrapper=True, no_rewrites=True ,nopython=True, nogil=True)
-def f{uid}_loop_opt_1(Z, res):
-    for i in nb.prange(n):
-        res[i] = f{uid}_uloop_opt_1(Z[i])
-
-@nb.jit(cache = True, parallel=True, fastmath=True, forceinline=True, looplift=True, inline='always', target_backend='host', no_cfunc_wrapper=True, no_rewrites=True ,nopython=True, nogil=True)
-def f{uid}_loop_opt(Z):
-    z=np.zeros(len(Z), dtype=Z.dtype)
-    f{uid}_loop_opt_1(Z, z)
-    return z
-        """
-
-        return original_tree, loop_tree, vectorize_tree, loop_tree_opt, vectorize_tree_opt
+        final_name =  "vlopt_" + final_func_callmap_name 
+        if axis > 1:
+            raise ValueError    
+        result = {"name": final_name, "source_code": _make_func(two_dim, final_func_callmap_name, final_form, dtype, "0" if axis else "1", "[i, :]" if axis else "[:, i]", len(original_funcs))}
+        result["function"] = _compile_tree(result, globals)
+        return result
+    elif ndims == 3:
+        final_name =  "vlopt_" + final_func_callmap_name 
+        globals.update({'sliding_window_view': sliding_window_view})
+        if axis > 1:
+            raise ValueError    
+        result = {"name": final_name, "source_code": _make_func(three_dim_axis_1 if axis else three_dim_axis_0, final_func_callmap_name, final_form, dtype, "", "", len(original_funcs))}
+        result["function"] = _compile_tree(result, globals)
+        return result
 
 
+# def _compile_tree(func: Dict[str, str], globals: Dict[str, Any]) -> Dict:
+#     def wrapped(x):
+#         if func['name'] not in globals:
+#             exec(compile(ast.parse(func['source_code']), filename=fp.name, mode="exec"), globals)
+#         return globals[func['name']](x)
+#     wrapped.__name__ = func['name']
+#     wrapped.__qualname__ = "__numba__." + func['name']
+#     return wrapped
 
-
-
-    return original_tree, loop_func_tree, vectorize_func_tree, loop_func_tree_oc, vectorize_func_tree_oc
-
-def numba_decorate(func_tree: ast.AST, nopython: bool = True, nogil: bool = True, parallel: bool = True, fastmath: bool = True, forceinline: bool = True, looplift: bool = True, target_backend: bool = True, no_cfunc_wrapper: bool = True, cache: bool = True) -> ast.AST:
-    """
-    Apply Numba JIT decorators to a function's AST for optimized execution.
-
-    This function modifies a given function's AST by adding Numba JIT decorators,
-    which enable just-in-time compilation for improved performance.
-
-    Parameters
-    ----------
-    func_tree : ast.AST
-        The AST of the function to be decorated.
-    nopython : bool, default True
-        Flag to enable Numba's 'nopython' mode for more efficient code.
-    nogil : bool, default True
-        Flag to release the GIL (Global Interpreter Lock) within Numba-compiled functions.
-    parallel : bool, default True
-        Flag to enable automatic parallelization of loops in Numba-compiled functions.
-    fastmath : bool, default True
-        Flag to enable fast math operations within Numba-compiled functions.
-    forceinline : bool, default True
-        Flag to force inlining of functions within Numba-compiled functions.
-    looplift : bool, default True
-        Flag to enable loop lifting within Numba-compiled functions.
-    target_backend : bool, default True
-        Flag to set a specific target backend for Numba compilation.
-    no_cfunc_wrapper : bool, default True
-        Flag to avoid creating a C function wrapper.
-    cache : bool, default True
-        Flag to enable caching of the compiled function.
-
-    Returns
-    -------
-    ast.AST
-        The modified AST with Numba JIT decorators applied.
-
-    Examples
-    --------
-    >>> func_tree = ast.parse('def func(x): return x + 1')
-    >>> decorated_tree = numba_decorate(func_tree)
-    """
-    nb_compyled_func_tree = copy.deepcopy(ast.fix_missing_locations(func_tree))
-    numba_decorator = ast.Call(
-        func=ast.Attribute(value=ast.Name(id='nb', ctx=ast.Load()), attr='njit', ctx=ast.Load()),
-        args=[
-            # ast.Call(
-            #     func=ast.Attribute(value=ast.Name(id='nb', ctx=ast.Load()), attr='int8', ctx=ast.Load()),
-            #     args=[ast.Attribute(value=ast.Name(id='nb', ctx=ast.Load()), attr='types.string', ctx=ast.Load())],
-            #     keywords=[]
-            # )
-        ],
-        keywords=[
-            ast.keyword(arg='cache', value=ast.Constant(value=True)),
-            ast.keyword(arg='parallel', value=ast.Constant(value=True)),
-            ast.keyword(arg='fastmath', value=ast.Constant(value=True)),
-            ast.keyword(arg='forceinline', value=ast.Constant(value=True)),
-            ast.keyword(arg='looplift', value=ast.Constant(value=True)),
-            ast.keyword(arg='inline', value=ast.Constant(value='always')),
-            ast.keyword(arg='target_backend', value=ast.Constant(value='host')),
-            ast.keyword(arg='no_cfunc_wrapper', value=ast.Constant(value=True)),
-            ast.keyword(arg='no_rewrites', value=ast.Constant(value=True)),
-            ast.keyword(arg='nogil', value=ast.Constant(value=True)),
-        ]
-    )
-    nb_compyled_func_tree.body[0].decorator_list.append(numba_decorator)
-    nb_compyled_func_tree.body[0].name += '_nb_compyled'
-    return ast.fix_missing_locations(nb_compyled_func_tree)
-
-def encapulate(compute_function: ast.AST, callmap_tree: ast.AST, original_tree: ast.AST) -> ast.AST:
-    """
-    Encapsulate a function's AST with additional functionality defined in another AST.
-
-    This function combines ASTs to encapsulate the original function within additional
-    logic defined in other ASTs. Typically used to add preprocessing or postprocessing steps.
-
-    Parameters
-    ----------
-    wrap_tree : ast.AST
-        The AST of the function that will encapsulate the original function.
-    callmap_tree : ast.AST
-        The AST of the function that provides additional preprocessing logic.
-    original_tree : ast.AST
-        The AST of the original function to be encapsulated.
-
-    Returns
-    -------
-    ast.AST
-        The combined AST with the original function encapsulated within the additional logic.
-
-    Examples
-    --------
-    >>> wrap_tree = ast.parse('def wrapper(): pass')
-    >>> callmap_tree = ast.parse('def callmap(x): return x')
-    >>> original_tree = ast.parse('def original(x): return x + 1')
-    >>> encapsulated_tree = encapulate(wrap_tree, callmap_tree, original_tree)
-    """
-    wrapper_str = f"""
-def {compute_function.body[0].name}(Z):
-    
-
-    return compute(Z)
-    """
-
-    wrap_tree = ast.parse(wrapper_str)
-    wrap_tree.body[0].body.insert(0, callmap_tree.body[0])
-    wrap_tree.body[0].body.insert(1, original_tree.body[0])
-    compute_function.body[0].name = 'compute'
-    wrap_tree.body[0].body.insert(2, compute_function.body[0])
-    return ast.fix_missing_locations(wrap_tree)
-
-
-def compile_tree(built_func_tree: ast.AST, exec_globals: Dict[str, Any], qualname: str, build_qualifier: str) -> Dict:
-    """
-    Compile an AST into an executable function and store it in a dictionary.
-
-    This function compiles an AST representing a Python function into an executable
-    function object and stores it in a dictionary under a specified key.
-
-    Parameters
-    ----------
-    built_func_tree : ast.AST
-        The AST of the function to be compiled.
-    exec_globals : Dict[str, Any]
-        The global namespace in which the function should be compiled.
-    qualname : str
-        The qualified name to be used for the compiled function.
-    build_qualifier : str
-        A string qualifier to distinguish different versions of the compiled function.
-
-    Returns
-    -------
-    Dict
-        A dictionary containing the compiled function under the specified key.
-
-    Examples
-    --------
-    >>> func_tree = ast.parse('def func(x): return x + 1')
-    >>> exec_globals = globals()
-    >>> compiled_funcs = compile_tree(func_tree, exec_globals, 'func', '_compiled')
-    """
-    try:
-        compyled = None
-        def wrapped(x):
-            nonlocal compyled
-            if compyled is None:
-                exec(compile(built_func_tree, filename="<ast>", mode="exec"), exec_globals)
-                compyled = exec_globals[qualname + build_qualifier]
-            return compyled(x)
-        return {build_qualifier: wrapped}
-    except Exception as e:
-        logger.warning(e)
-        return {}
-    
-
-def _prepare_funcs(original_func: Callable, mapping: Dict[str, int], func_int_identifier: str, D3_to_D2: bool = False, no_vectorized: bool = False) -> Dict[str, Callable]:
-    """
-    Prepare and compile various versions of a function for optimized execution.
-
-    This function takes an original function and prepares different versions of it, 
-    including loop-based, vectorized, and compiled forms, based on the provided parameters 
-    and mapping. These versions are used for optimized execution in different scenarios.
-
-    Parameters
-    ----------
-    original_func : Callable
-        The original function to be transformed and compiled.
-    mapping : Dict[str, int]
-        A mapping dict influencing the behavior of the function.
-    func_int_identifier : str
-        A unique identifier for the function.
-    D3_to_D2 : bool, default False
-        Indicates if the function is used for 3D to 2D array conversion.
-    no_vectorized : bool, default False
-        Indicates if the function should not have a vectorized version.
-
-    Returns
-    -------
-    Dict[str, Callable]
-        A dictionary containing different versions of the prepared function.
-
-    Examples
-    --------
-    >>> def original_function(x):
-    >>>     return x + 1
-    >>> mapping = {'x': 0}
-    >>> prepared_funcs = _prepare_funcs(original_function, mapping, 'func_id')
-    """
-    available_funcs = {'original': original_func}
-
-    asts = create_transformed_function_ast(original_func, mapping, func_int_identifier, D3_to_D2 = D3_to_D2, no_vectorized = no_vectorized)
-    
-    exec_globals = globals().copy()
-    exec_globals.update({'np': np, 'nb': nb})
-
-    callmap_func_ast, callmap_name = create_callmap_function_ast(mapping)
-    callmap_func_tree = ast.fix_missing_locations(ast.Module(body=[callmap_func_ast], type_ignores=[])) 
-    # nb_compyled_callmap_func_tree = numba_decorate(callmap_func_tree, )
-
-    original_tree, loop_func_tree, vectorize_func_tree, loop_func_tree_oc, vectorize_func_tree_oc = create_trans
-    formed_function_ast(original_func, callmap_name, mapping, func_int_identifier, D3_to_D2 = D3_to_D2)
-    available_funcs.update(compile_tree(original_tree, exec_globals, func_int_identifier, '_original'))
-    loop_func_tree = encapulate(loop_func_tree, callmap_func_tree, original_tree)
-    available_funcs.update(compile_tree(loop_func_tree, exec_globals, func_int_identifier, '_loop'))
-    
-    if not no_vectorized:
-        vectorize_func_tree = encapulate(vectorize_func_tree, callmap_func_tree, original_tree)
-        available_funcs.update(compile_tree(vectorize_func_tree, exec_globals, func_int_identifier, '_vectorized'))
-
-    nb_compyled_loop_func_tree = numba_decorate(loop_func_tree)
-    if not no_vectorized:
-        nb_compyled_vectorize_func_tree = numba_decorate(vectorize_func_tree)
-        available_funcs.update(compile_tree(nb_compyled_vectorize_func_tree, exec_globals, func_int_identifier, '_vectorized_nb_compyled'))
-
-    available_funcs.update(compile_tree(nb_compyled_loop_func_tree, exec_globals, func_int_identifier, '_loop_nb_compyled'))
-
-    nb_compyled_original_tree = numba_decorate(original_tree)
-    nb_compyled_callmap_func_tree = numba_decorate(callmap_func_tree)
-    if not no_vectorized:
-        vectorize_func_tree_oc = encapulate(vectorize_func_tree_oc, nb_compyled_callmap_func_tree, nb_compyled_original_tree)
-        nb_compyled_vectorize_func_oc_tree = numba_decorate(vectorize_func_tree_oc)
-        available_funcs.update(compile_tree(nb_compyled_vectorize_func_oc_tree, exec_globals, func_int_identifier, '_oc_vectorized_nb_compyled'))
-
-    nb_compyled_loop_func_tree_oc = encapulate(loop_func_tree_oc, nb_compyled_callmap_func_tree, nb_compyled_original_tree)
-    nb_compyled_loop_func_tree_oc = numba_decorate(nb_compyled_loop_func_tree_oc)
-    available_funcs.update(compile_tree(nb_compyled_loop_func_tree_oc, exec_globals, func_int_identifier, '_oc_loop_nb_compyled'))
-
-    return available_funcs
-
-
-
-#
-# def make_class_decorator(function_decorator: Callable) -> Callable:
-#     """
-#     Creates a class decorator from a given function decorator.
-#
-#     Args:
-#         function_decorator (Callable): A function decorator to be applied to class methods.
-#
-#     Returns:
-#         Callable: A class decorator.
-#     """
-#     @functools.wraps(function_decorator)
-#     def class_decorator(cls: Type) -> Type:
-#         """
-#         The class decorator generated from the function decorator.
-#
-#         Args:
-#             cls (Type): The class to which the decorator is applied.
-#
-#         Returns:
-#             Type: The decorated class.
-#         """
-#         for attr_name, attr_value in cls.__bases__[0].__dict__.items():
-#             if callable(attr_value)  and attr_name not in cls.__dict__:
-#                 setattr(cls, attr_name, function_decorator(attr_value))
-#         for attr_name, attr_value in cls.__dict__.items():
-#              if callable(attr_value) and not attr_name.startswith('_'):
-#                 setattr(cls, attr_name, function_decorator(attr_value))
-#         return cls
-#     return class_decorator
-#
-# def autowrap_pandas_return(fn: Callable) -> Callable:
-#     """and not attr_name.startswith('_')
-#     Decorator to add validation and error handling to class methods.
-#
-#     Args:
-#         fn (Callable): The original method of the class.
-#
-#     Returns:
-#         Callable: The decorated method with added validation and error handling.
-#     """
-#
-#     if isinstance(fn, types.FunctionType):
-#         return fn
-#     @functools.wraps(fn)
-#     def wrapper(self, *args, **kwargs):
-#         print('here', self._outside_call, type(self), args, kwargs, fn, type(fn))
-#         if self._outside_call:
-#             self._outside_call = False
-#             if not hasattr(fn, '__self__'):
-#                 res = fn(*args, **kwargs)
-#             else:
-#                 res = fn(self, *args, **kwargs)
-#             print(type(res))
-#             if isinstance(res, pandas.DataFrame) and not isinstance(res, pandopt.DataFrame):
-#                 res = pandopt.DataFrame(res)
-#             elif isinstance(res, pandas.core.window.rolling.Rolling) and not isinstance(res, pandopt.RollOpt):
-#                 res = pandopt.RollOpt(res)
-#             elif isinstance(res, pandas.core.groupby.generic.DataFrameGroupBy) and not isinstance(res, pandopt.GroupOpt):
-#                 res = pandopt.GroupOpt(res)
-#             self._outside_call = True
-#             return res
-#         if not hasattr(fn, '__self__'):
-#             return fn(*args, **kwargs)
-#         return fn(self, *args, **kwargs)
-#     return wrapper
-
-# @decorator
-# def {func_int_identifier}_loop(Z):
-#     def callmap(x):
-#         ....do stuff
-#     def temporary(x):
-#         do stuf...
-
-#     n, c, t = Z.shape
-#     res = np.zeros((n, c))
-#     for col in nb.prange(c):
-#         for row in nb.prange(n):
-#             res[row, col] = temporary(Z[row,col,:])
-#     return res
-
-
-# but instead
-
-# def {func_int_identifier}_loop():
-#     @decorator
-#     def callmap(x):
-#         ....do stuff
-#     @decorator
-#     def temporary(x):
-#         do stuf...
-#     @decorator
-#     def compute(Z)
-#         n, c, t = Z.shape
-#         res = np.zeros((n, c))
-#         for col in nb.prange(c):
-#             for row in nb.prange(n):
-#                 res[row, col] = temporary(Z[row,col,:])
-#         return res
-#     return compute
+# def _prepare_func(original_func: Callable, index: Iterable[str], axis: int, ndims: int, dtype: str, globals: Dict[str, Any]) -> Tuple[ast.AST, ast.AST, ast.AST]:
+#     result = {}
+#     fuid, original_name, original, modified, vectorized, callmap = AstModifier(original_func = original_func, index = index, axis = axis, ndims = ndims)
+#     name_with_id = original_func.__name__ + fuid
+#     result['original'] = {"name":  name_with_id + "_original", "source_code": original}
+#     result["original"]["function"] = _compile_tree(result["original"], globals)
+#     if ndims == 1:
+#         decorator =  "@nb.njit(nb.{dtype}(nb.{dtype}[:]), cache = False, fastmath=True, forceinline=True, looplift=True, inline='always', target_backend='host', no_cfunc_wrapper=True, no_rewrites=True, nogil=True)\n"
+#         result['modified'] = decorator + modified
+#         return result
+#     elif ndims == 2:
+#         final_name =  "vlopt_" + fuid 
+#         modified_name = name_with_id + "_modified"
+#         if axis > 1:
+#             raise ValueError    
+#         result['modified'] = {"name": final_name, "source_code": _make_func(two_dim_axis_0 if axis == 0 else two_dim_axis_1, modified_name, modified, dtype, fuid)}
+#         result["modified"]["function"] = _compile_tree(result["modified"], globals)
+#         if vectorized is not None:
+#             vectorized_name = name_with_id + '_vectorized'
+#             result['vectorized'] = {"name": vectorized_name, "source_code": vectorized}
+#             result["vectorized"]["function"] = _compile_tree(result["vectorized"], globals)
+#         return result
+#     elif ndims == 3:
+#         raise NotImplemented
