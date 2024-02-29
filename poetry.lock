@@ -214,19 +214,6 @@ files = [
 ]
 
 [[package]]
-name = "tbb"
-version = "2021.11.0"
-description = "Intel® oneAPI Threading Building Blocks (oneTBB)"
-optional = false
-python-versions = "*"
-files = [
-    {file = "tbb-2021.11.0-py2.py3-none-manylinux1_i686.whl", hash = "sha256:1c70583babdde880612187c12e0000ef99d1acccb9602817d07c4429fd75d731"},
-    {file = "tbb-2021.11.0-py2.py3-none-manylinux1_x86_64.whl", hash = "sha256:28a95e924a84dd201d9ea1b51cd89de259a866bafa0a29618f0e61339dd8f71c"},
-    {file = "tbb-2021.11.0-py3-none-win32.whl", hash = "sha256:3d93cb61a90c45e9ed7a2396c34ecec98e8c399daa2182a613686e1e043e1008"},
-    {file = "tbb-2021.11.0-py3-none-win_amd64.whl", hash = "sha256:688349e1c5758ecc121293135502022ac25d5704f0a3dd890b34094414949f89"},
-]
-
-[[package]]
 name = "tzdata"
 version = "2024.1"
 description = "Provider of IANA time zone data"
@@ -240,4 +227,4 @@ files = [
 [metadata]
 lock-version = "2.0"
 python-versions = "^3.12"
-content-hash = "51e12614ff5f8a16bcaaad94c539f6a92b8fb5505522ae40a86a6d0778ac0252"
+content-hash = "d11574087ce00ae84cba03db73b3474427949d57eafc7dc563a3b7cb085ef5dc"
